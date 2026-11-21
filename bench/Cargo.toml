@@ -1,0 +1,14 @@
+[package]
+name = "jitmo-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# No external crates: all Windows calls are declared by hand in src/win.rs.
+[dependencies]
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = true
+debug = false

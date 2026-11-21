@@ -25,7 +25,7 @@ Real speed is lower. This is the same problem datacentres have with HBM, on slow
 
 ## 3. The KV cache grows
 
-The model's memory of earlier words grows with prompt length. Measured in the old jitmo repo: a 0.8B model used 937 MB at context 4096 and 580 MB at 768.
+The model's memory of earlier words grows with prompt length. Measured in the jitmo agent repo: a 0.8B model used 937 MB at context 4096 and 580 MB at 768.
 
 ## 4. Shrinking costs quality
 

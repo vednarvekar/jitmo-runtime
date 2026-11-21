@@ -101,6 +101,48 @@ Web research, 18 Nov 2026. Numbers are what each paper's authors report, usually
 
 llama.cpp is the stronger starting point. Neither engine protects the rest of the PC.
 
+### 11. Second research round (21 Nov 2026)
+
+**Diffusion language models: watch, don't build on yet.**
+- In practice they give only ~2 to 3 tokens per weight read (LLaDA2.0-mini: 2.55 per pass). More than that costs quality.
+- On a CPU each pass runs a whole block of tokens through every weight, so the job becomes compute-bound. The big GPU speedups depend on spare compute a laptop CPU doesn't have.
+- They break JSON output and invent API parameters (Lu et al., ACL 2026), which is bad for tool use.
+- Best small candidates: block diffusion models converted from normal models, like SDAR-4B and Fast-dLLM v2 1.5B. Only GPU numbers exist.
+- llama.cpp has an experimental `llama-diffusion-cli`.
+- The "Harvard" work is Sitan Chen and Sham Kakade's group (Kempner Institute). It is about quality and theory, not speed.
+
+**Multi-token prediction (MTP): usable today.**
+- Some models ship extra heads that guess the next tokens (DeepSeek-V3, Qwen3.5 small models, Gemma 4).
+- llama.cpp merged MTP support in May 2026. Reported ~1.5 to 2× on large models.
+- It's the only practical way to get more than one token per weight read at batch 1. Expect ~1.3 to 2×, less on chat.
+
+**Hybrid models fix the KV cache by design.**
+- Qwen3.5-2B mixes 18 linear-attention layers with only 6 normal attention layers.
+- Estimated KV: ~12 KB per token vs ~112 KB for Qwen3-1.7B. At 32K context that's ~0.4 GB instead of ~3.7 GB (about 9× less).
+- Similar: Granite 4.0-H (over 70% less RAM), LFM2 (up to 2× faster on CPU).
+
+**Small MoE models.** SmallThinker-4B-A0.6B (over 20 tok/s on consumer CPUs in ~1 GB), Granite-4.0-H-Tiny (7B total, 1B active), LFM2-8B-A1B (~5 GB at Q4, tight for 8 GB). Speed follows active parameters, but quality sits at about 3 to 4B dense level.
+
+**Not freezing the PC.**
+- EdgePace (Oct 2026): pauses the LLM at safe points when foreground apps risk bandwidth contention. 24 to 96% fewer foreground deadline misses while keeping 65 to 98% of LLM speed (phones and Jetson boards).
+- Throttling a co-running job recovers ~89% of speed (CXL tiering study, 2025).
+- **No study measures UI lag on Windows or x86 laptops.** That gap is open for us.
+
+**Top 5 for our goal (research agent's ranking)**
+1. Hybrid linear-attention 2 to 4B models (Qwen3.5, LFM2, Granite 4.0-H)
+2. Built-in MTP speculative decoding in llama.cpp
+3. A bandwidth-aware pause and throttle scheduler (EdgePace / SERENO style) for Windows
+4. Small MoE models (SmallThinker-4B-A0.6B, LFM2-8B-A1B)
+5. One base model + per-request LoRA
+
+Sources for this round: LLaDA https://arxiv.org/abs/2502.09992 · Fast-dLLM v2 https://arxiv.org/abs/2509.26328 · SDAR https://arxiv.org/abs/2510.06303 · LLaDA2.0-mini https://huggingface.co/inclusionAI/LLaDA2.0-mini · dLLM agent failures https://arxiv.org/abs/2601.12979 · Harvard (Kim, Chen, Kakade) https://arxiv.org/abs/2502.06768 · llama.cpp diffusion https://github.com/ggml-org/llama.cpp/tree/master/examples/diffusion · llama.cpp MTP https://github.com/ggml-org/llama.cpp/pull/22673 · Qwen3.5-2B https://huggingface.co/Qwen/Qwen3.5-2B · Granite 4.0 https://www.ibm.com/new/announcements/ibm-granite-4-0-hyper-efficient-high-performance-hybrid-models · LFM2 https://arxiv.org/abs/2511.23404 · SmallThinker https://arxiv.org/abs/2507.20984 · LFM2-8B-A1B https://www.liquid.ai/blog/lfm2-8b-a1b-an-efficient-on-device-mixture-of-experts · EdgePace https://arxiv.org/abs/2610.37307 · CXL tiering https://arxiv.org/pdf/2503.17864 · llama.cpp server LoRA https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md
+
+### 12. Related projects
+
+| Project | What it is | Compared with us |
+|---|---|---|
+| **OpenJarvis** (Stanford Hazy Research + Scaling Intelligence Lab, Apache-2.0, ~17.7k stars) https://github.com/open-jarvis/OpenJarvis | "Personal AI, on personal devices." A local-first agent framework: agents, skills, connectors (Gmail, Slack, WhatsApp…), memory, voice, evals for energy and cost. | **Same top goal, different layer.** It sits on top of existing engines (Ollama, llama.cpp, MLX, vLLM…). Its docs say nothing about RAM management, 8 GB laptops, chaining small models, or not slowing the PC. Far ahead of us on assistant features and team. The runtime layer underneath is the open space. Full study: [05 OpenJarvis Study](05-openjarvis-study.md). |
+
 ## What is actually effective (for a 2 to 4B model on an 8 GB laptop)
 
 | Works today | Works with conditions | Not for us (yet) |

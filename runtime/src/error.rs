@@ -1,0 +1,52 @@
+//! One error type for the whole runtime. The API turns it into an OpenAI-style error body:
+//! `{"error": {"message": ..., "type": <code>, "code": <code>}}`.
+
+#[derive(Debug, Clone)]
+pub struct Error {
+    pub status: u16,
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl Error {
+    fn new(status: u16, code: &'static str, message: impl Into<String>) -> Error {
+        Error { status, code, message: message.into() }
+    }
+    pub fn bad_request(m: impl Into<String>) -> Error {
+        Error::new(400, "invalid_request_error", m)
+    }
+    pub fn model_not_found(m: impl Into<String>) -> Error {
+        Error::new(404, "model_not_found", m)
+    }
+    pub fn chain_not_found(m: impl Into<String>) -> Error {
+        Error::new(404, "chain_not_found", m)
+    }
+    /// A chain template could not be filled (for example a JSON field is missing).
+    pub fn chain_step(m: impl Into<String>) -> Error {
+        Error::new(422, "chain_step_failed", m)
+    }
+    pub fn queue_full(m: impl Into<String>) -> Error {
+        Error::new(503, "queue_full", m)
+    }
+    pub fn insufficient_memory(m: impl Into<String>) -> Error {
+        Error::new(503, "insufficient_memory", m)
+    }
+    pub fn load_failed(m: impl Into<String>) -> Error {
+        Error::new(503, "model_load_failed", m)
+    }
+    /// llama-server failed or went away during a request.
+    pub fn engine(m: impl Into<String>) -> Error {
+        Error::new(502, "engine_error", m)
+    }
+
+    pub fn with_prefix(mut self, prefix: &str) -> Error {
+        self.message = format!("{prefix}: {}", self.message);
+        self
+    }
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.message, self.code)
+    }
+}

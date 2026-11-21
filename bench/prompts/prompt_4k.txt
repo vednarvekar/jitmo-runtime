@@ -1,0 +1,196 @@
+# 00. Vision
+
+## One line
+
+**Run useful AI models locally on ordinary laptops, smartly and cheaply, so people can build on them instead of paying for cloud LLMs.**
+
+In the owner's words: a runtime or system that runs small models in a chain, so **everyone can have their own personal assistant, locally, to do any work they want.**
+
+## The problem
+
+- Cloud LLMs cost a lot of money for every request.
+- Local models are too heavy today. On an 8 GB laptop they eat RAM and CPU, and the PC can freeze.
+- So people keep paying for the cloud, even for small tasks a local model could do.
+
+## What we want
+
+1. **2 to 4 billion parameter models running well on an 8 GB RAM laptop.** Not trillion-parameter models. Small, useful ones.
+2. **The PC never freezes.** It may slow down a little while the model works. It must never stop everything else.
+3. **Small models working in a chain** (for example router, planner, tool-caller, writer), without each one costing a full share of RAM.
+4. **Light on resources.** RAM, CPU and power are used smartly and efficiently. RAM is used, not avoided.
+5. **A base to build on.** Assistants and tools run on it locally instead of calling the cloud.
+
+## What this is not
+
+- Loading and unloading models fast was a **starting idea**, not the goal. We use whatever approach works best.
+- Not a cloud service. Everything runs on the device.
+- Not a new model. We run open models, and may convert or compress them.
+
+## Attitude
+
+- **Effort is not a limit.** If we must rebuild something like llama.cpp or ONNX Runtime from scratch, we do it.
+- **New approaches are welcome.** We study current research and go beyond it where we can.
+- **Measure, don't guess.** Every claim gets a number from a real 8 GB laptop.
+
+## Research to learn from
+
+The main problem across this research is the **memory wall**: the chip waits on memory more than it computes. It is the same problem whether the memory is HBM on a datacentre GPU or RAM on a laptop.
+Full findings, numbers, verdicts and sources: [02 Research](02-research.md).
+
+| Work | Who, when | Core idea | Why it matters to us |
+|---|---|---|---|
+| **LLM in a Flash** | Apple, 2023 | Keep the model on flash storage (SSD). Load only the rows a word needs. Reuse recently loaded rows ("windowing"). Store rows that are read together side by side ("row-column bundling"). | Runs models bigger than the RAM you have. |
+| **PowerInfer** | Shanghai Jiao Tong Univ., 2023 | A few "hot" neurons fire for most words. Keep them on the fast chip and leave the "cold" ones on the slower one. | Keep only the useful part of the model in fast memory. |
+| **PowerInfer-2** | Shanghai Jiao Tong Univ., 2024 | The same idea on smartphones, with neurons streamed from storage. Ran a large MoE model on a phone. | Shows this works on weak, low-RAM devices. |
+| **Deja Vu** | Liu et al., ICML 2023 | "Contextual sparsity": each word needs only part of the model. A small predictor guesses which part and skips the rest. | Read fewer bytes per word, so it runs faster. |
+| **BitNet b1.58** | Microsoft, 2024 (2B model in 2025, runs with `bitnet.cpp`) | Weights are only -1, 0 or +1 (about 1.58 bits). Multiplications turn into additions. | A 2B model in about 0.4 GB, fast on a plain CPU. |
+| **Speculative decoding** | Google and DeepMind, 2022 to 2023 | A tiny model drafts several words. The big model checks them all in one pass. The output is identical to the big model's. | One read of the weights gives several words. |
+| **Megakernels ("Look Ma, No Bubbles")** | Stanford Hazy Research, 2025 | Fuse the whole model into one GPU program, so the chip never sits idle between steps waiting on memory. Related: ThunderKittens. | Cut the waiting time, not just the work. |
+| **FlexGen** | Stanford and others, 2023 | Splits weights and KV cache across GPU, CPU RAM and disk, scheduled for the best throughput. | Plan which data lives where. |
+| **MoE offloading** | Eliseev and Mazur, 2023 | Runs Mixtral on small GPUs by caching recently used experts and guessing the next ones. | Cache and prefetch the parts of the model in use. |
+| **KV cache compression** | Many papers (for example KIVI, 2024) | Store the model's memory of earlier words in fewer bits. | Long prompts stop eating RAM. |
+
+## Owner decisions
+
+| Date | Decision |
+|---|---|
+| 21 Nov 2026 | **Build both layers:** the runtime (runs small models in a chain on 8 GB laptops without freezing the PC) and the personal assistant on top of it. |
+
+## Open questions (owner to decide)
+
+- Who is it for: only jitmo, any developer, or both?
+- Which laptops first: Windows only, or Mac and Linux too?
+- What counts as "doesn't freeze" and "runs well", in numbers?
+
+
+# 01. Blockers
+
+What stops a 2 to 4B model from running well on an 8 GB laptop without freezing it.
+*est.* = estimate, still to be measured on a real laptop.
+
+## 1. The memory wall (the main one)
+
+To write one word, the model reads all its weights from RAM. The CPU mostly waits on memory instead of computing.
+
+> words per second ≈ RAM speed ÷ bytes read per word
+
+| Model | Size at 4-bit *est.* | Laptop RAM at ~40 to 60 GB/s *est.* |
+|---|---|---|
+| 2B | ~1.2 GB | ~30 to 50 words/s at best |
+| 4B | ~2.4 GB | ~15 to 25 words/s at best |
+
+Real speed is lower. This is the same problem datacentres have with HBM, on slower memory.
+**The fix is reading fewer bytes per word**, not faster code alone.
+
+## 2. The PC freezes
+
+- Engines like llama.cpp use every CPU core by default, so nothing else gets a turn.
+- When RAM runs out, Windows pages to disk and everything stalls.
+- An 8 GB laptop has only about 2 to 3 GB free *est.* once Windows and a browser are running.
+
+## 3. The KV cache grows
+
+The model's memory of earlier words grows with prompt length. Measured in the old jitmo repo: a 0.8B model used 937 MB at context 4096 and 580 MB at 768.
+
+## 4. Shrinking costs quality
+
+Fewer bits per weight (3-bit, 2-bit) means a smaller, faster model, but a dumber one. Models trained for low bits (like BitNet) avoid this, but there are only a few of them.
+
+## 5. Other chips sit unused
+
+Most laptops have an integrated GPU, and newer ones have an NPU (AI chip). Most engines run only on the CPU. Each chip needs its own code.
+
+## 6. Several models fight for RAM
+
+Each loaded model costs its full size in RAM. Today, loading one takes 1.2 to 2.7 s (measured: 270M to 0.8B models), and private memory is about 2× the file size.
+
+## 7. Existing engines are not built for this
+
+llama.cpp and ONNX Runtime assume the model sits fully in RAM. They have no RAM budget, no "be nice to the PC" mode, and no partial loading.
+
+## 8. Laptops vary a lot
+
+RAM speed, SSD speed, CPU features (AVX2, AVX-512, VNNI), GPU and NPU all differ. Something fast on one laptop can be slow on another.
+
+## 9. Solo builder, big scope
+
+An engine is years of work for a team. Scope has to be cut hard: one model, one laptop, one number at a time.
+
+## Not blockers
+
+- **SSD wear.** Reading does not wear out an SSD.
+- **Model size alone.** A 3B model at 4-bit already fits in 8 GB. Freezing comes from blockers 2 and 3, not from size.
+
+
+# 02. Research: what others are doing
+
+Web research, 18 Nov 2026. Numbers are what each paper's authors report, usually on hardware different from ours. Treat them as hints, not promises.
+
+## The big picture
+
+1. **Everything comes back to memory bandwidth.** Writing each word means reading the weights. Every serious approach either reads fewer bytes, reads them from a faster place, or hides the waiting.
+2. **The PC freezes from memory pressure and bandwidth fights, not mainly from CPU.** Recent work (SERENO, OSDI '26, and an Apple Silicon study) shows that a background LLM badly hurts foreground apps, while the LLM itself barely slows down.
+3. **Most results are on GPUs or phones.** Very little targets an 8 GB Windows laptop running on CPU or integrated GPU. That gap is ours.
+
+## Approaches, grouped
+
+### 1. Smaller weights (quantization)
+
+| Work | What it does | Reported result | Verdict for us |
+|---|---|---|---|
+| 4-bit (GGUF Q4 and similar) | 4 bits per weight | Standard; quality close to full precision | **Proven.** Our baseline. |
+| QuIP#, AQLM, QTIP (2024) | Clever 2 to 3-bit codes | QTIP 2-bit on Llama 2 70B: C4 perplexity 5.48 (QuIP# 5.71, AQLM 5.62) | **Promising but unproven for 2 to 4B.** Mostly tested on 7B to 70B. |
+| BitNet b1.58 2B4T + bitnet.cpp (Microsoft, 2025) | Model trained with weights of only -1, 0, +1 | ~0.4 GB non-embedding memory; 2.37× to 6.17× faster on x86 CPUs; quality competitive with other 2B models | **Very effective, few models.** Only works with models trained this way, and only fast with bitnet.cpp. |
+
+### 2. Read only what each word needs (sparsity)
+
+| Work | What it does | Reported result | Verdict for us |
+|---|---|---|---|
+| Deja Vu (ICML 2023) | Predicts which heads and neurons each word needs and skips the rest | OPT-175B: over 2× faster than FasterTransformer, no quality loss | **Effective on big ReLU models.** Less tested on small modern models. |
+| PowerInfer (SOSP 2024) | "Hot" neurons on the fast chip, "cold" ones on the CPU | Up to 11.69× over llama.cpp (Falcon-40B ReLU), 2.89× average for INT4 models, RTX 4090 | **Effective only on sparse (ReLU) models.** Standard SiLU models gain little. |
+| ProSparse (2024) | Retrains models to be sparse (~89% sparsity) | Up to 4.52× with PowerInfer | **Makes sparsity work, but needs retraining.** |
+| TEAL (2024) | Training-free sparsity on any model | 1.53× at 40% and 1.8× at 50% sparsity; works with quantization | **Practical.** No retraining, modest gain. |
+
+### 3. Keep the model on the SSD, load parts (offloading)
+
+| Work | What it does | Reported result | Verdict for us |
+|---|---|---|---|
+| LLM in a Flash (Apple, 2023) | Weights on flash, load only needed rows; windowing and row-column bundling | Models up to 2× the DRAM size; 4 to 5× faster than naive loading on CPU | **Works, depends on sparsity.** Useful for keeping RAM use low. |
+| PowerInfer-2 (2024) | Flash offloading plus sparsity on phones; NPU for dense work, CPU for sparse | TurboSparse-Mixtral-47B at 11.68 words/s on a phone; ~40% less memory for models that fit | **Strongest proof of the idea on weak devices.** Needs sparse models. |
+| Mixtral offloading (2023), ProMoE, Fiddler | Cache and prefetch MoE experts | Mixtral at 2 to 3 words/s on consumer hardware; ProMoE 2.84× decode over older offloading | **For MoE models only.** Transfer speed is the limit. |
+| FlexInfer, MNN-LLM | Async prefetch, overlapping reads with compute; DRAM plus flash storage | Survey summaries only | **Same idea, to check.** |
+
+### 4. More words per weight read
+
+| Work | What it does | Reported result | Verdict for us |
+|---|---|---|---|
+| Speculative decoding (Google, DeepMind, 2022 to 2023) | Small model drafts, big model verifies; output is identical | 2 to 3× on GPUs | **Unclear on small local models.** An MLX test found little gain for small 4-bit models. Needs a same-family draft. |
+| EAGLE-3 (2025) | Trained draft head instead of a draft model | 3.0 to 3.4× on Llama-3.3-70B, H100 | **GPU-proven, model-specific.** Unknown on CPU. |
+
+### 5. Stop the chip waiting
+
+| Work | What it does | Reported result | Verdict for us |
+|---|---|---|---|
+| Megakernels, "Look Ma, No Bubbles" (Stanford Hazy Research, May 2025) | Fuse the whole Llama-1B forward pass into one GPU program, no idle gaps between steps | 78% memory-bandwidth use on H100, over 1.5× faster than existing systems | **The idea applies, the code does not.** Datacentre GPUs only. |
+
+### 6. Smaller working memory (KV cache)
+
+| Work | What it does | Reported result | Verdict for us |
+|---|---|---|---|
+| KIVI (ICML 2024) | 2-bit KV cache | 2.6× lower peak memory on Llama-2-7B | **4-bit KV is safe. 2-bit hurts newer models** (Kitty, 2025: big drops on Qwen3-8B and Llama3-8B in maths). |
+| llama.cpp `--cache-type-k/v` | 8-bit or 4-bit KV cache | q8 near lossless, q4 noticeable (anecdotal) | **Available today.** |
+
+### 7. Models designed for low RAM
+
+| Work | What it does | Reported result | Verdict for us |
+|---|---|---|---|
+| Gemma 3n (Google, 2025) | Per-Layer Embeddings kept off fast memory; MatFormer lets you cut sub-models | 5B and 8B raw parameters running in ~2 GB and ~3 GB | **Very relevant.** The model itself is built for our problem. |
+
+### 8. Other chips
+
+| Work | What it does | Reported result | Verdict for us |
+|---|---|---|---|
+| Laptop NPUs (Intel OpenVINO, AMD Ryzen AI, Qualcomm) | Run models on the AI chip | Intel NPU 18.55 words/s in MLPerf Client; mostly vendor claims | **Good for low power, not speed.** Decode i
+
+---
+Task: summarize the document above in five short bullet points, then list three open questions it raises.

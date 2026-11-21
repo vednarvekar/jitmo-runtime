@@ -1,0 +1,63 @@
+# jitmo-runtime v0 config. Every key is optional; the values below are the defaults unless
+# marked "example". Relative paths are relative to this file. Reference: docs/06-runtime-api.md
+
+[server]
+host = "127.0.0.1"
+port = 8090
+max_queue = 8              # requests that may wait while one generation runs
+
+[model]
+name = "jitmo-base"        # the model id clients send
+path = 'V:\jitmo-sandbox\models\Qwen3-4B-Instruct-2507-Q4_K_M.gguf'
+llama_server = 'V:\jitmo-sandbox\llama\llama-server.exe'
+port = 0                   # private port of the llama-server child; 0 = any free port
+ctx_size = 4096
+threads = 0                # 0 = physical cores - 1, between 1 and 3
+kv_cache_type = "f16"      # q8_0 saves ~267 MB at ctx 4096 on Qwen3-4B but read prompts slower in the baseline
+flash_attn = "on"          # a quantized V cache needs flash attention on
+mmap = true
+no_repack = true           # no private repacked copy of the weights: ~half the RAM, ~20% slower
+low_priority = true        # child runs at below-normal CPU priority
+# example: Qwen3-family templates read this; it turns "thinking" off. Unknown keys are ignored.
+chat_template_kwargs = { enable_thinking = false }
+extra_args = []
+log_file = "llama-server.log"
+load_timeout_secs = 180
+
+[budget]
+memory_cap_mb = 1536       # Job Object commit (private bytes) cap on the child; 0 = none.
+                           # mmap'd weights are NOT counted: this bounds KV cache + buffers.
+reserve_free_mb = 1536     # refuse to load if less than this would stay free
+load_estimate_mb = 0       # 0 = model file size + memory_cap_mb
+pressure_free_mb = 512     # unload when free RAM stays below this
+idle_unload_secs = 90      # unload after this long without requests; 0 = never
+watch_interval_ms = 1000
+
+# ---- example chain: works with no adapters ----
+[[chains]]
+name = "classify-answer"
+description = "Decide what kind of message it is, then answer in a fitting style."
+
+[[chains.steps]]
+name = "classify"
+system = """Classify the user's message as exactly one kind:
+question = asks for information or an explanation
+task = asks you to write, change or plan something
+chat = greeting or small talk"""
+input = "{input}"
+max_tokens = 16
+temperature = 0.0
+json_schema = { type = "object", properties = { kind = { type = "string", enum = ["question", "task", "chat"] } }, required = ["kind"], additionalProperties = false }
+
+[[chains.steps]]
+name = "answer"
+system = """You are a helpful assistant running on the user's own laptop.
+The user's message is a {classify.kind}.
+For a question: answer in at most three short sentences.
+For a task: do it, briefly.
+For chat: reply in one friendly sentence."""
+input = "{input}"
+max_tokens = 200
+temperature = 0.3
+# To use a LoRA adapter for a step:
+# lora = { path = 'adapters/answer.gguf', scale = 1.0 }

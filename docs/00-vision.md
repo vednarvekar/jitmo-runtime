@@ -4,6 +4,8 @@
 
 **Run useful AI models locally on ordinary laptops, smartly and cheaply, so people can build on them instead of paying for cloud LLMs.**
 
+In the owner's words: a runtime or system that runs small models in a chain, so **everyone can have their own personal assistant, locally, to do any work they want.**
+
 ## The problem
 
 - Cloud LLMs cost a lot of money for every request.
@@ -14,7 +16,7 @@
 
 1. **2 to 4 billion parameter models running well on an 8 GB RAM laptop.** Not trillion-parameter models. Small, useful ones.
 2. **The PC never freezes.** It may slow down a little while the model works. It must never stop everything else.
-3. **Several models when needed**, without each one costing a full share of RAM.
+3. **Small models working in a chain** (for example router, planner, tool-caller, writer), without each one costing a full share of RAM.
 4. **Light on resources.** RAM, CPU and power are used smartly and efficiently. RAM is used, not avoided.
 5. **A base to build on.** Assistants and tools run on it locally instead of calling the cloud.
 
@@ -48,8 +50,15 @@ Full findings, numbers, verdicts and sources: [02 Research](02-research.md).
 | **MoE offloading** | Eliseev and Mazur, 2023 | Runs Mixtral on small GPUs by caching recently used experts and guessing the next ones. | Cache and prefetch the parts of the model in use. |
 | **KV cache compression** | Many papers (for example KIVI, 2024) | Store the model's memory of earlier words in fewer bits. | Long prompts stop eating RAM. |
 
+## Owner decisions
+
+| Date | Decision |
+|---|---|
+| 21 Nov 2026 | **Build both layers:** the runtime (runs small models in a chain on 8 GB laptops without freezing the PC) and the personal assistant on top of it. |
+| 21 Nov 2026 | **Two repos, two names.** jitmo-runtime (this repo) is the engine. jitmo agent (`V:\Code\jitmo`) is the assistant and its overall architecture, built on the runtime. jitmo agent is kept, not replaced. |
+
 ## Open questions (owner to decide)
 
-- Who is it for: only jitmo, any developer, or both?
+- Beyond jitmo agent (the first user), should other developers and apps use the runtime too?
 - Which laptops first: Windows only, or Mac and Linux too?
 - What counts as "doesn't freeze" and "runs well", in numbers?

@@ -11,6 +11,20 @@ Principle: **measure first, then build.** Every step ends with real numbers from
 | **2. Ready tricks** | Apply the known tricks (below) one by one and measure each. | We know what each trick gives on this laptop |
 | **3. Decide what to build** | Pick the first new part from the real numbers. Likely candidate: "don't freeze the PC" scheduling. | The owner chooses |
 
+## Runtime v0 (decided 21 Nov 2026)
+
+The first thing we build. Written in **Rust**, on top of llama.cpp at first.
+
+| Part | What it does |
+|---|---|
+| **One base model** | Qwen3-4B (Q4_K_M) loaded once |
+| **Chain** | A request runs through steps (for example router, planner, tool-caller, writer). Each step has its own instructions and an optional LoRA add-on. |
+| **RAM budget** | Watches free RAM, caps the model's memory (for example 2.5 GB), unloads when idle, refuses to load when RAM is short |
+| **Don't freeze the PC** | Limits threads; backs off when the PC is busy |
+| **OpenAI-style API** | `/v1/chat/completions` and `/v1/models`, so jitmo agent (and OpenJarvis) can use it directly |
+
+Code lives in `runtime/`.
+
 ## Step 1 setup
 
 - **Laptop:** Intel i5-1135G7 (4 cores, 8 threads), 16 GB RAM, Windows 11, Iris Xe integrated GPU.
@@ -36,3 +50,9 @@ Principle: **measure first, then build.** Every step ends with real numbers from
 | Date | Event |
 |---|---|
 | 21 Nov 2026 | Step 1 started: measurement agent and research agent launched |
+| 21 Nov 2026 | Research round 2 done (see 02 Research, sections 11 and 12) |
+| 21 Nov 2026 | Owner decided: build both layers (runtime + assistant) |
+| 21 Nov 2026 | Baseline paused: laptop on battery; waiting for AC power |
+| 21 Nov 2026 | Baseline resumed on AC; first speeds: Qwen3-4B ~10.8 words/s at 4 threads (final numbers in results/01-baseline.md) |
+| 21 Nov 2026 | Owner approved runtime v0 (Rust, on llama.cpp); build started |
+| 21 Nov 2026 | Step 1 baseline done: see [results/01-baseline.md](results/01-baseline.md). Key findings: Qwen3-4B 11.2 tok/s (81% of RAM bandwidth); weight repacking doubles RAM (`--no-repack` halves it, ~20% slower); under a 2.5 GB cap speed falls to ~1.2 tok/s; a memory-heavy app slows 44 to 60% while the model runs |

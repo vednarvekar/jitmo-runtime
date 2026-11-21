@@ -1,0 +1,108 @@
+# 00. Vision
+
+## One line
+
+**Run useful AI models locally on ordinary laptops, smartly and cheaply, so people can build on them instead of paying for cloud LLMs.**
+
+In the owner's words: a runtime or system that runs small models in a chain, so **everyone can have their own personal assistant, locally, to do any work they want.**
+
+## The problem
+
+- Cloud LLMs cost a lot of money for every request.
+- Local models are too heavy today. On an 8 GB laptop they eat RAM and CPU, and the PC can freeze.
+- So people keep paying for the cloud, even for small tasks a local model could do.
+
+## What we want
+
+1. **2 to 4 billion parameter models running well on an 8 GB RAM laptop.** Not trillion-parameter models. Small, useful ones.
+2. **The PC never freezes.** It may slow down a little while the model works. It must never stop everything else.
+3. **Small models working in a chain** (for example router, planner, tool-caller, writer), without each one costing a full share of RAM.
+4. **Light on resources.** RAM, CPU and power are used smartly and efficiently. RAM is used, not avoided.
+5. **A base to build on.** Assistants and tools run on it locally instead of calling the cloud.
+
+## What this is not
+
+- Loading and unloading models fast was a **starting idea**, not the goal. We use whatever approach works best.
+- Not a cloud service. Everything runs on the device.
+- Not a new model. We run open models, and may convert or compress them.
+
+## Attitude
+
+- **Effort is not a limit.** If we must rebuild something like llama.cpp or ONNX Runtime from scratch, we do it.
+- **New approaches are welcome.** We study current research and go beyond it where we can.
+- **Measure, don't guess.** Every claim gets a number from a real 8 GB laptop.
+
+## Research to learn from
+
+The main problem across this research is the **memory wall**: the chip waits on memory more than it computes. It is the same problem whether the memory is HBM on a datacentre GPU or RAM on a laptop.
+Full findings, numbers, verdicts and sources: [02 Research](02-research.md).
+
+| Work | Who, when | Core idea | Why it matters to us |
+|---|---|---|---|
+| **LLM in a Flash** | Apple, 2023 | Keep the model on flash storage (SSD). Load only the rows a word needs. Reuse recently loaded rows ("windowing"). Store rows that are read together side by side ("row-column bundling"). | Runs models bigger than the RAM you have. |
+| **PowerInfer** | Shanghai Jiao Tong Univ., 2023 | A few "hot" neurons fire for most words. Keep them on the fast chip and leave the "cold" ones on the slower one. | Keep only the useful part of the model in fast memory. |
+| **PowerInfer-2** | Shanghai Jiao Tong Univ., 2024 | The same idea on smartphones, with neurons streamed from storage. Ran a large MoE model on a phone. | Shows this works on weak, low-RAM devices. |
+| **Deja Vu** | Liu et al., ICML 2023 | "Contextual sparsity": each word needs only part of the model. A small predictor guesses which part and skips the rest. | Read fewer bytes per word, so it runs faster. |
+| **BitNet b1.58** | Microsoft, 2024 (2B model in 2025, runs with `bitnet.cpp`) | Weights are only -1, 0 or +1 (about 1.58 bits). Multiplications turn into additions. | A 2B model in about 0.4 GB, fast on a plain CPU. |
+| **Speculative decoding** | Google and DeepMind, 2022 to 2023 | A tiny model drafts several words. The big model checks them all in one pass. The output is identical to the big model's. | One read of the weights gives several words. |
+| **Megakernels ("Look Ma, No Bubbles")** | Stanford Hazy Research, 2025 | Fuse the whole model into one GPU program, so the chip never sits idle between steps waiting on memory. Related: ThunderKittens. | Cut the waiting time, not just the work. |
+| **FlexGen** | Stanford and others, 2023 | Splits weights and KV cache across GPU, CPU RAM and disk, scheduled for the best throughput. | Plan which data lives where. |
+| **MoE offloading** | Eliseev and Mazur, 2023 | Runs Mixtral on small GPUs by caching recently used experts and guessing the next ones. | Cache and prefetch the parts of the model in use. |
+| **KV cache compression** | Many papers (for example KIVI, 2024) | Store the model's memory of earlier words in fewer bits. | Long prompts stop eating RAM. |
+
+## Owner decisions
+
+| Date | Decision |
+|---|---|
+| 21 Nov 2026 | **Build both layers:** the runtime (runs small models in a chain on 8 GB laptops without freezing the PC) and the personal assistant on top of it. |
+
+## Open questions (owner to decide)
+
+- Who is it for: only jitmo, any developer, or both?
+- Which laptops first: Windows only, or Mac and Linux too?
+- What counts as "doesn't freeze" and "runs well", in numbers?
+
+
+# 01. Blockers
+
+What stops a 2 to 4B model from running well on an 8 GB laptop without freezing it.
+*est.* = estimate, still to be measured on a real laptop.
+
+## 1. The memory wall (the main one)
+
+To write one word, the model reads all its weights from RAM. The CPU mostly waits on memory instead of computing.
+
+> words per second ≈ RAM speed ÷ bytes read per word
+
+| Model | Size at 4-bit *est.* | Laptop RAM at ~40 to 60 GB/s *est.* |
+|---|---|---|
+| 2B | ~1.2 GB | ~30 to 50 words/s at best |
+| 4B | ~2.4 GB | ~15 to 25 words/s at best |
+
+Real speed is lower. This is the same problem datacentres have with HBM, on slower memory.
+**The fix is reading fewer bytes per word**, not faster code alone.
+
+## 2. The PC freezes
+
+- Engines like llama.cpp use every CPU core by default, so nothing else gets a turn.
+- When RAM runs out, Windows pages to disk and everything stalls.
+- An 8 GB laptop has only about 2 to 3 GB free *est.* once Windows and a browser are running.
+
+## 3. The KV cache grows
+
+The model's memory of earlier words grows with prompt length. Measured in the old jitmo repo: a 0.8B model used 937 MB at context 4096 and 580 MB at 768.
+
+## 4. Shrinking costs quality
+
+Fewer bits per weight (3-bit, 2-bit) means a smaller, faster model, but a dumber one. Models trained for low bits (like BitNet) avoid this, but there are only a few of them.
+
+## 5. Other chips sit unused
+
+Most laptops have an integrated GPU, and newer ones have an NPU (AI chip). Most engines run only on the CPU. Each chip needs its own code.
+
+## 6. Several models fight for RAM
+
+Each loaded model costs its full size in RAM. Today, loading one takes 1.2 to 2.7 s (measured: 270M to 0.8B models), and private memory is about 2× the file si
+
+---
+Task: summarize the document above in five short bullet points, then list three open questions it raises.
