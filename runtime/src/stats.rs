@@ -74,6 +74,7 @@ pub fn mb(bytes: u64) -> f64 {
 pub enum UnloadReason {
     Idle,
     MemoryPressure,
+    MemoryCritical,
     Admin,
     Crashed,
     Shutdown,
@@ -84,6 +85,7 @@ impl UnloadReason {
         match self {
             UnloadReason::Idle => "idle",
             UnloadReason::MemoryPressure => "memory_pressure",
+            UnloadReason::MemoryCritical => "memory_critical",
             UnloadReason::Admin => "admin",
             UnloadReason::Crashed => "crashed",
             UnloadReason::Shutdown => "shutdown",

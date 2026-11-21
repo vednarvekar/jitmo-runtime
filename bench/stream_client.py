@@ -1,6 +1,7 @@
 """Stream tokens from a running llama-server and log the wall-clock time of every token.
 
-Usage: python -I stream_client.py --port 8090 --n 400 --out tokens.json [--prompt-file f] [--prompt "text"]
+Usage: python -I stream_client.py --port 8090 --n 400 --out tokens.json [--prompt-file f] [--prompt "text"] [--chat]
+--chat: use the OpenAI endpoint /v1/chat/completions (model jitmo-base), e.g. through jitmo-runtime.
 Writes JSON: {"t_ms": [epoch ms of each streamed token], "timings": <server timings>, ...}
 Uses only the Python standard library.
 """
@@ -16,19 +17,35 @@ ap.add_argument("--out", required=True)
 ap.add_argument("--prompt", default="Write a long, detailed story about a lighthouse keeper who discovers a hidden map. Keep going for many paragraphs.")
 ap.add_argument("--prompt-file")
 ap.add_argument("--ignore-eos", action="store_true", default=True)
+ap.add_argument("--chat", action="store_true")
 a = ap.parse_args()
 
 prompt = open(a.prompt_file, encoding="utf-8").read() if a.prompt_file else a.prompt
-body = json.dumps({
-    "prompt": prompt,
-    "n_predict": a.n,
-    "stream": True,
-    "ignore_eos": a.ignore_eos,
-    "temperature": 0.7,
-    "seed": 42,
-    "cache_prompt": False,
-}).encode()
-req = urllib.request.Request(f"http://127.0.0.1:{a.port}/completion", data=body,
+if a.chat:
+    path = "/v1/chat/completions"
+    body = json.dumps({
+        "model": "jitmo-base",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": a.n,
+        "stream": True,
+        "ignore_eos": a.ignore_eos,
+        "temperature": 0.7,
+        "seed": 42,
+        "cache_prompt": False,
+        "timings_per_token": False,
+    }).encode()
+else:
+    path = "/completion"
+    body = json.dumps({
+        "prompt": prompt,
+        "n_predict": a.n,
+        "stream": True,
+        "ignore_eos": a.ignore_eos,
+        "temperature": 0.7,
+        "seed": 42,
+        "cache_prompt": False,
+    }).encode()
+req = urllib.request.Request(f"http://127.0.0.1:{a.port}{path}", data=body,
                              headers={"Content-Type": "application/json"})
 t_send = time.time() * 1000
 stamps = []
@@ -45,12 +62,21 @@ with urllib.request.urlopen(req, timeout=3600) as r:
             break
         d = json.loads(payload)
         now = time.time() * 1000
-        if d.get("content"):
-            stamps.append(now)
-            text.append(d["content"])
-        if d.get("stop"):
-            timings = d.get("timings")
-            break
+        if a.chat:
+            ch = (d.get("choices") or [{}])[0]
+            c = (ch.get("delta") or {}).get("content")
+            if c:
+                stamps.append(now)
+                text.append(c)
+            if d.get("timings"):
+                timings = d.get("timings")
+        else:
+            if d.get("content"):
+                stamps.append(now)
+                text.append(d["content"])
+            if d.get("stop"):
+                timings = d.get("timings")
+                break
         if len(stamps) % 5 == 0:
             with open(a.out, "w") as f:
                 json.dump({"t_send_ms": t_send, "t_ms": stamps, "timings": None, "partial": True}, f)

@@ -5,6 +5,7 @@ mod budget;
 mod chain;
 mod config;
 mod error;
+mod gguf;
 mod llama;
 mod pacer;
 mod stats;
@@ -111,18 +112,21 @@ async fn run(args: Args) -> Result<()> {
     let sup = supervisor::Supervisor::new(cfg.clone(), stats);
     let chains = chain::Chain::compile_all(&cfg);
     info!(
-        "model '{}' = {} | ctx {} | threads {} | kv {} | cap {} MB | reserve {} MB | idle unload {} s | chains: {}",
+        "model '{}' = {} | ctx {} | threads {} | kv {} | cap {} MB ({}) | reserve {} MB | idle unload {} s | pacer {} | chains: {}",
         cfg.model.name,
         cfg.model.path.display(),
         cfg.model.ctx_size,
         sup.threads(),
         cfg.model.kv_cache_type,
-        cfg.budget.memory_cap_mb,
+        sup.plan.cap_mb(),
+        sup.plan.source,
         cfg.budget.reserve_free_mb,
         cfg.budget.idle_unload_secs,
+        cfg.pacer.mode,
         if chains.is_empty() { "none".to_string() } else { chains.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ") }
     );
     sup.spawn_watchdog();
+    sup.spawn_pacer();
 
     let addr = format!("{}:{}", cfg.server.host, cfg.server.port);
     let listener = tokio::net::TcpListener::bind(&addr).await.with_context(|| format!("cannot listen on {addr}"))?;

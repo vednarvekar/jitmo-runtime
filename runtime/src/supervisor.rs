@@ -3,10 +3,12 @@
 //! - Starts it lazily on the first request, on a private 127.0.0.1 port, inside a Job Object
 //!   (commit cap + kill-on-close, so it can never outlive the runtime).
 //! - One generation at a time: callers take the single `Slot`; others wait in a bounded queue.
-//! - A watchdog unloads the model when it is idle, when the system is short of memory, and
-//!   notices when the child dies by itself.
+//! - A watchdog unloads the model when it is idle, when the system is short of memory (after
+//!   the running generation, or at once below `critical_free_mb`), and notices when the child
+//!   dies by itself.
+//! - The pacer loop caps the child's CPU while the user is busy (see `pacer.rs`).
 
-use crate::budget;
+use crate::budget::{self, MemPlan, MemoryAction};
 use crate::config::{Config, ModelConfig};
 use crate::error::Error;
 use crate::llama::{self, HttpClient};
@@ -16,7 +18,7 @@ use crate::win::{self, Job, LowMemorySignal, ProcessMemory, HANDLE};
 use hyper::StatusCode;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -75,6 +77,7 @@ pub struct Supervisor {
     pub stats: Arc<Stats>,
     pub http: HttpClient,
     pub pacer: Pacer,
+    pub plan: MemPlan,
     threads: u32,
     adapters: Vec<PathBuf>,
     state: tokio::sync::Mutex<Option<Running>>,
@@ -84,6 +87,8 @@ pub struct Supervisor {
     waiting: AtomicUsize,
     last_activity: Mutex<Instant>,
     low_memory: Option<LowMemorySignal>,
+    /// Memory pressure was seen during a generation: unload before the next one starts.
+    pending_unload: AtomicBool,
 }
 
 /// The right to run generations. Held for one request (or a whole chain). Dropping it lets
@@ -118,11 +123,14 @@ impl Supervisor {
         if low_memory.is_none() {
             warn!("cannot create the Windows low-memory notification; using the free-RAM floor only");
         }
+        let plan = MemPlan::new(&cfg);
+        let pacer = Pacer::new(cfg.pacer.clone(), threads, budget::logical_processors(), cfg.model.low_priority);
         Arc::new(Supervisor {
             cfg,
             stats,
             http: llama::client(),
-            pacer: Pacer,
+            pacer,
+            plan,
             threads,
             adapters,
             state: tokio::sync::Mutex::new(None),
@@ -132,7 +140,17 @@ impl Supervisor {
             waiting: AtomicUsize::new(0),
             last_activity: Mutex::new(Instant::now()),
             low_memory,
+            pending_unload: AtomicBool::new(false),
         })
+    }
+
+    pub fn unload_pending(&self) -> bool {
+        self.pending_unload.load(Ordering::SeqCst)
+    }
+
+    /// The running child's pid and job, for the pacer.
+    pub fn child_job(&self) -> Option<(u32, Arc<Job>)> {
+        self.info.lock().unwrap_or_else(|p| p.into_inner()).as_ref().map(|i| (i.pid, i.job.clone()))
     }
 
     pub fn threads(&self) -> u32 {
@@ -195,6 +213,12 @@ impl Supervisor {
         };
         let queue_ms = t0.elapsed().as_secs_f64() * 1000.0;
         self.touch();
+        if self.pending_unload.swap(false, Ordering::SeqCst) {
+            // Pressure was seen while the previous generation ran: unload first, then load
+            // again only if the budget check passes (else 503 insufficient_memory).
+            info!("unloading the model for memory pressure before the next request");
+            self.unload(UnloadReason::MemoryPressure).await;
+        }
         let (port, load_ms) = self.ensure_loaded().await?;
         self.pacer.before_generation().await;
         Ok(Slot { _permit: permit, sup: self.clone(), port, queue_ms, load_ms })
@@ -211,7 +235,7 @@ impl Supervisor {
             let run = st.take().expect("checked above");
             self.finish_stop(run, UnloadReason::Crashed).await;
         }
-        if let Err(why) = budget::check_before_load(&self.cfg) {
+        if let Err(why) = budget::check_before_load(&self.cfg, &self.plan) {
             self.stats.refused_memory();
             warn!("{why}");
             return Err(Error::insufficient_memory(why));
@@ -248,6 +272,9 @@ impl Supervisor {
         let m = &self.cfg.model;
         let port = if m.port != 0 { m.port } else { free_port().map_err(|e| Error::load_failed(format!("no free port: {e}")))? };
         let args = llama_args(m, port, self.threads, &self.adapters);
+        if let Some(c) = self.plan.cap_bytes {
+            info!("memory cap {} MB ({})", c / (1024 * 1024), self.plan.source);
+        }
         info!("starting llama-server: {} {}", m.llama_server.display(), args.join(" "));
 
         let mut cmd = tokio::process::Command::new(&m.llama_server);
@@ -263,7 +290,7 @@ impl Supervisor {
             .spawn()
             .map_err(|e| Error::load_failed(format!("cannot start {}: {e}", m.llama_server.display())))?;
         let pid = child.id().unwrap_or(0);
-        let cap = (self.cfg.budget.memory_cap_mb > 0).then(|| self.cfg.budget.memory_cap_mb * 1024 * 1024);
+        let cap = self.plan.cap_bytes;
         let job = match contain(&child, cap) {
             Ok(j) => Arc::new(j),
             Err(e) => {
@@ -287,8 +314,9 @@ impl Supervisor {
                     let alloc_failed = lower.contains("alloc") || lower.contains("mem_buffer");
                     if near_cap || alloc_failed {
                         msg.push_str(&format!(
-                            "; memory allocation failed under the memory cap of {} MB (budget.memory_cap_mb): raise the cap or lower model.ctx_size",
-                            self.cfg.budget.memory_cap_mb
+                            "; memory allocation failed under the memory cap of {} MB (budget.memory_cap_mb, {}): raise the cap or lower model.ctx_size",
+                            self.plan.cap_mb(),
+                            self.plan.source
                         ));
                     }
                 }
@@ -390,8 +418,10 @@ impl Supervisor {
             let exited = st.as_mut().and_then(|r| r.child.try_wait().ok().flatten());
             if let Some(status) = exited {
                 let run = st.take().expect("child present");
-                let near_cap = self.cfg.budget.memory_cap_mb > 0
-                    && run.job.peak_process_commit().is_some_and(|p| p as f64 >= (self.cfg.budget.memory_cap_mb * 1024 * 1024) as f64 * 0.97);
+                let near_cap = self
+                    .plan
+                    .cap_bytes
+                    .is_some_and(|cap| run.job.peak_process_commit().is_some_and(|p| p as f64 >= cap as f64 * 0.97));
                 warn!(
                     "llama-server exited by itself ({status}){}; the model is unloaded",
                     if near_cap { ", after reaching the memory cap" } else { "" }
@@ -401,20 +431,45 @@ impl Supervisor {
         }
         if self.phase() != Phase::Loaded {
             *low_count = 0;
+            self.pending_unload.store(false, Ordering::SeqCst);
             return;
         }
-        // 2. Memory pressure: two checks in a row, so a short dip does not unload.
-        match budget::pressure(&self.cfg, self.low_memory.as_ref()) {
-            Some(why) => {
-                *low_count += 1;
-                if *low_count >= 2 {
+        // 2. Memory. Pressure (two checks in a row): the running generation may finish, then
+        //    unload. Critical (one check): unload at once, even mid-generation.
+        let Some(mem) = win::memory_status() else { return };
+        let (low, signal) = budget::is_low(&self.cfg, mem.avail, self.low_memory.as_ref());
+        *low_count = if low { *low_count + 1 } else { 0 };
+        match budget::memory_action(&self.cfg, mem.avail, signal, *low_count) {
+            MemoryAction::UnloadNow(why) => {
+                warn!("critical memory ({why}): unloading the model now; a running generation fails");
+                self.pending_unload.store(false, Ordering::SeqCst);
+                self.unload(UnloadReason::MemoryCritical).await;
+                *low_count = 0;
+                return;
+            }
+            MemoryAction::UnloadWhenFree(why) => {
+                if let Ok(_permit) = self.gate.clone().try_acquire_owned() {
                     warn!("memory pressure ({why}): unloading the model now");
+                    self.pending_unload.store(false, Ordering::SeqCst);
                     self.unload(UnloadReason::MemoryPressure).await;
                     *low_count = 0;
                     return;
                 }
+                if !self.pending_unload.swap(true, Ordering::SeqCst) {
+                    warn!("memory pressure ({why}): the running generation may finish, then the model is unloaded");
+                }
             }
-            None => *low_count = 0,
+            MemoryAction::None => {}
+        }
+        // Pressure seen earlier; the generation has ended and nobody is waiting.
+        if self.pending_unload.load(Ordering::SeqCst) {
+            if let Ok(_permit) = self.gate.clone().try_acquire_owned() {
+                if self.pending_unload.swap(false, Ordering::SeqCst) {
+                    info!("the generation ended: unloading the model for memory pressure");
+                    self.unload(UnloadReason::MemoryPressure).await;
+                    return;
+                }
+            }
         }
         // 3. Idle.
         let idle = self.cfg.budget.idle_unload_secs;
@@ -426,6 +481,21 @@ impl Supervisor {
                 }
             }
         }
+    }
+
+    /// The pacer loop. With `mode = "off"` it still samples (so /stats shows the signals) but
+    /// never caps.
+    pub fn spawn_pacer(self: &Arc<Self>) {
+        let sup = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(sup.pacer.poll_interval());
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let child = if sup.phase() == Phase::Loaded { sup.child_job() } else { None };
+                sup.pacer.tick(child);
+            }
+        });
     }
 
     pub async fn shutdown(&self) {
@@ -466,6 +536,11 @@ pub fn llama_args(m: &ModelConfig, port: u16, threads: u32, adapters: &[PathBuf]
     if m.no_repack {
         a.push("--no-repack".into());
     }
+    // Both grow the child's private memory with use; the automatic memory cap includes them.
+    a.push("--cache-ram".into());
+    a.push(m.cache_ram_mb.to_string());
+    a.push("--ctx-checkpoints".into());
+    a.push(m.ctx_checkpoints.to_string());
     for path in adapters {
         a.push("--lora".into());
         a.push(path.display().to_string());
@@ -529,6 +604,7 @@ mod tests {
         assert!(s.contains("-ctk q8_0 -ctv q8_0"));
         assert!(s.contains("--parallel 1"));
         assert!(s.contains("-lm none") && s.contains("--no-repack"));
+        assert!(s.contains("--cache-ram 256 --ctx-checkpoints 4"));
         assert!(s.contains("--lora a.gguf --lora b.gguf --lora-init-without-apply"));
         assert!(s.ends_with("--cache-reuse 256"));
         let plain = llama_args(&ModelConfig { no_repack: false, ..Default::default() }, 1, 1, &[]).join(" ");

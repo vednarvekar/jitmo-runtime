@@ -1,4 +1,4 @@
-# jitmo-runtime v0 config. Every key is optional; the values below are the defaults unless
+# jitmo-runtime v0.1 config. Every key is optional; the values below are the defaults unless
 # marked "example". Relative paths are relative to this file. Reference: docs/06-runtime-api.md
 
 [server]
@@ -12,12 +12,14 @@ path = 'V:\jitmo-sandbox\models\Qwen3-4B-Instruct-2507-Q4_K_M.gguf'
 llama_server = 'V:\jitmo-sandbox\llama\llama-server.exe'
 port = 0                   # private port of the llama-server child; 0 = any free port
 ctx_size = 4096
-threads = 0                # 0 = physical cores - 1, between 1 and 3
+threads = 0                # 0 = physical cores - 1, at most half the logical processors (3 on a 4c/8t CPU)
 kv_cache_type = "f16"      # q8_0 saves ~267 MB at ctx 4096 on Qwen3-4B but read prompts slower in the baseline
 flash_attn = "on"          # a quantized V cache needs flash attention on
 mmap = true
 no_repack = true           # no private repacked copy of the weights: ~half the RAM, ~20% slower
 low_priority = true        # child runs at below-normal CPU priority
+cache_ram_mb = 256         # llama-server prompt cache in RAM (--cache-ram); counted in the auto cap
+ctx_checkpoints = 4        # SWA/hybrid context checkpoints per slot (--ctx-checkpoints); counted in the auto cap
 # example: Qwen3-family templates read this; it turns "thinking" off. Unknown keys are ignored.
 chat_template_kwargs = { enable_thinking = false }
 extra_args = []
@@ -25,13 +27,25 @@ log_file = "llama-server.log"
 load_timeout_secs = 180
 
 [budget]
-memory_cap_mb = 1536       # Job Object commit (private bytes) cap on the child; 0 = none.
+memory_cap_mb = "auto"     # Job Object commit (private bytes) cap on the child: "auto" = computed from
+                           # the GGUF metadata and ctx (KV + state + buffers + caches + 640 MiB), a number = MiB, 0 = none.
                            # mmap'd weights are NOT counted: this bounds KV cache + buffers.
 reserve_free_mb = 1536     # refuse to load if less than this would stay free
-load_estimate_mb = 0       # 0 = model file size + memory_cap_mb
-pressure_free_mb = 512     # unload when free RAM stays below this
+load_estimate_mb = 0       # 0 = model file size + memory cap
+pressure_free_mb = 1024    # below this twice in a row: finish the running generation, then unload
+critical_free_mb = 500     # below this once: unload at once, even mid-generation; 0 = never
 idle_unload_secs = 90      # unload after this long without requests; 0 = never
 watch_interval_ms = 1000
+
+[pacer]                    # "don't freeze the PC": cap the model's CPU while the user is busy
+mode = "auto"              # auto | always | off
+poll_ms = 300
+input_active_ms = 5000     # keyboard/mouse input this recently = user active; 0 = ignore
+others_cpu_busy_pct = 10.0 # other processes above this % of all logical CPUs = busy; 0 = ignore
+low_free_mb = 2048         # free RAM below this = busy; 0 = ignore
+busy_cpu_pct = 50          # while busy the model gets this % of its normal CPU (Job Object hard cap)
+busy_priority = "unchanged" # or "idle": also drop the child to idle priority while busy
+release_after_ms = 2000    # keep the cap this long after the last busy sample
 
 # ---- example chain: works with no adapters ----
 [[chains]]

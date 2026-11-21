@@ -13,6 +13,13 @@ type BOOL = i32;
 pub const CREATE_SUSPENDED: u32 = 0x0000_0004;
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 pub const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+pub const NORMAL_PRIORITY_CLASS: u32 = 0x0000_0020;
+pub const IDLE_PRIORITY_CLASS: u32 = 0x0000_0040;
+const PROCESS_SET_INFORMATION: u32 = 0x0200;
+const JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION_CLASS: i32 = 1;
+const JOB_OBJECT_CPU_RATE_CONTROL_INFORMATION_CLASS: i32 = 15;
+const JOB_OBJECT_CPU_RATE_CONTROL_ENABLE: u32 = 0x1;
+const JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP: u32 = 0x4;
 
 const JOB_OBJECT_LIMIT_PROCESS_MEMORY: u32 = 0x100;
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
@@ -88,6 +95,47 @@ struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
     PeakJobMemoryUsed: usize,
 }
 
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct JOBOBJECT_BASIC_ACCOUNTING_INFORMATION {
+    TotalUserTime: i64,
+    TotalKernelTime: i64,
+    ThisPeriodTotalUserTime: i64,
+    ThisPeriodTotalKernelTime: i64,
+    TotalPageFaultCount: u32,
+    TotalProcesses: u32,
+    ActiveProcesses: u32,
+    TotalTerminatedProcesses: u32,
+}
+
+/// JOBOBJECT_CPU_RATE_CONTROL_INFORMATION; the union is used as CpuRate.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct JOBOBJECT_CPU_RATE_CONTROL_INFORMATION {
+    ControlFlags: u32,
+    CpuRate: u32,
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct FILETIME {
+    lo: u32,
+    hi: u32,
+}
+
+impl FILETIME {
+    fn get(self) -> u64 {
+        (self.hi as u64) << 32 | self.lo as u64
+    }
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct LASTINPUTINFO {
+    cbSize: u32,
+    dwTime: u32,
+}
+
 /// SYSTEM_LOGICAL_PROCESSOR_INFORMATION; the 16-byte union is kept opaque.
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
@@ -111,6 +159,14 @@ extern "system" {
     fn CreateMemoryResourceNotification(kind: i32) -> HANDLE;
     fn QueryMemoryResourceNotification(h: HANDLE, state: *mut BOOL) -> BOOL;
     fn GetLogicalProcessorInformation(buf: *mut SYSTEM_LOGICAL_PROCESSOR_INFORMATION, len: *mut u32) -> BOOL;
+    fn GetSystemTimes(idle: *mut FILETIME, kernel: *mut FILETIME, user: *mut FILETIME) -> BOOL;
+    fn GetTickCount() -> u32;
+    fn SetPriorityClass(process: HANDLE, class: u32) -> BOOL;
+}
+
+#[link(name = "user32")]
+extern "system" {
+    fn GetLastInputInfo(info: *mut LASTINPUTINFO) -> BOOL;
 }
 
 #[link(name = "ntdll")]
@@ -227,6 +283,46 @@ impl Job {
         unsafe { TerminateJobObject(self.0, 1) };
     }
 
+    /// Hard-cap the job's CPU use to `rate` / 10000 of all logical processors, or remove the
+    /// cap (`None`). Takes effect at once on running processes.
+    pub fn set_cpu_rate(&self, rate: Option<u32>) -> io::Result<()> {
+        let mut info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION::default();
+        if let Some(r) = rate {
+            info.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
+            info.CpuRate = r.clamp(1, 10_000);
+        }
+        // SAFETY: valid in-struct with its size; live job handle.
+        let ok = unsafe {
+            SetInformationJobObject(
+                self.0,
+                JOB_OBJECT_CPU_RATE_CONTROL_INFORMATION_CLASS,
+                &mut info as *mut _ as *mut c_void,
+                std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
+            )
+        } != 0;
+        if ok {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    /// CPU time (user + kernel) used by all processes of the job so far, in 100 ns units.
+    pub fn cpu_time(&self) -> Option<u64> {
+        let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        // SAFETY: valid out-struct with its size.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                self.0,
+                JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION_CLASS,
+                &mut info as *mut _ as *mut c_void,
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                null_mut(),
+            )
+        } != 0;
+        ok.then_some((info.TotalUserTime + info.TotalKernelTime) as u64)
+    }
+
     /// Highest commit (private bytes) any process in the job has reached, in bytes.
     pub fn peak_process_commit(&self) -> Option<u64> {
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
@@ -280,6 +376,44 @@ impl Drop for LowMemorySignal {
     }
 }
 
+/// System CPU time summed over all logical processors, in 100 ns units.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemTimes {
+    pub idle: u64,
+    /// Kernel + user (kernel time includes idle time).
+    pub total: u64,
+}
+
+pub fn system_times() -> Option<SystemTimes> {
+    let (mut i, mut k, mut u) = (FILETIME::default(), FILETIME::default(), FILETIME::default());
+    // SAFETY: three valid out-pointers.
+    let ok = unsafe { GetSystemTimes(&mut i, &mut k, &mut u) } != 0;
+    ok.then(|| SystemTimes { idle: i.get(), total: k.get() + u.get() })
+}
+
+/// Milliseconds since the last keyboard or mouse input in this session.
+pub fn input_idle_ms() -> Option<u64> {
+    let mut li = LASTINPUTINFO { cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
+    // SAFETY: valid in/out struct with its size.
+    let ok = unsafe { GetLastInputInfo(&mut li) } != 0;
+    // SAFETY: plain call. Both are 32-bit tick counts, so the difference wraps correctly.
+    ok.then(|| unsafe { GetTickCount() }.wrapping_sub(li.dwTime) as u64)
+}
+
+/// Set the priority class of a process by PID.
+pub fn set_priority_class(pid: u32, class: u32) -> bool {
+    // SAFETY: plain Win32 calls; the handle is closed before returning.
+    unsafe {
+        let h = OpenProcess(PROCESS_SET_INFORMATION, 0, pid);
+        if h.is_null() {
+            return false;
+        }
+        let ok = SetPriorityClass(h, class) != 0;
+        CloseHandle(h);
+        ok
+    }
+}
+
 /// Number of physical CPU cores (not logical processors).
 pub fn physical_cores() -> Option<u32> {
     let mut len: u32 = 0;
@@ -310,6 +444,9 @@ mod tests {
         assert_eq!(std::mem::size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION>(), 32);
         assert_eq!(std::mem::size_of::<MEMORYSTATUSEX>(), 64);
         assert_eq!(std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>(), 80);
+        assert_eq!(std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>(), 48);
+        assert_eq!(std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>(), 8);
+        assert_eq!(std::mem::size_of::<LASTINPUTINFO>(), 8);
     }
 
     #[test]
@@ -319,5 +456,16 @@ mod tests {
         let cores = physical_cores().unwrap();
         let logical = std::thread::available_parallelism().unwrap().get() as u32;
         assert!(cores >= 1 && cores <= logical);
+        let t = system_times().unwrap();
+        assert!(t.total >= t.idle && t.total > 0);
+        assert!(input_idle_ms().is_some());
+    }
+
+    #[test]
+    fn a_job_cpu_cap_can_be_set_and_removed_at_runtime() {
+        let job = Job::new(None).unwrap();
+        job.set_cpu_rate(Some(1875)).unwrap();
+        job.set_cpu_rate(None).unwrap();
+        assert_eq!(job.cpu_time(), Some(0));
     }
 }

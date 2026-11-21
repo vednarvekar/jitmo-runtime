@@ -1,6 +1,8 @@
-# Smoke test for jitmo-runtime v0 (Windows PowerShell 5.1+).
+# Smoke test for jitmo-runtime v0.1 (Windows PowerShell 5.1+).
 # Starts the runtime with a small model, calls every endpoint, checks the llama-server child
-# goes away on /admin/unload and when the runtime is killed. Exit code 0 = all checks passed.
+# goes away on /admin/unload and when the runtime is killed. Part 2 checks the v0.1 rules:
+# memory pressure lets a running generation finish, critical memory aborts it, the pacer caps
+# the child. Exit code 0 = all checks passed.
 #
 #   powershell -ExecutionPolicy Bypass -File runtime\scripts\smoke.ps1 [-Model <gguf>] [-Port 8090]
 param(
@@ -99,6 +101,12 @@ try {
     # 8. /stats shows the loaded child and timings.
     $st = Get-Json '/stats'
     $childPid = [int]$st.child.pid
+    Check 'auto memory cap' (($st.budget.memory_cap_source -eq 'auto') -and ($st.budget.memory_cap_mb -gt $st.child.peak_private_mb)) `
+        ("cap={0}MB peak_private={1}MB kv={2} recurrent={3} compute={4}" -f $st.budget.memory_cap_mb, $st.child.peak_private_mb, `
+            $st.budget.memory_estimate_mb.kv, $st.budget.memory_estimate_mb.recurrent, $st.budget.memory_estimate_mb.compute)
+    Check '/stats pacer fields' (($null -ne $st.pacer.mode) -and ($null -ne $st.pacer.input_idle_ms) -and ($null -eq $st.pacer.last_error)) `
+        ("mode={0} state={1} input_idle={2}ms others_cpu={3}%" -f $st.pacer.mode, $st.pacer.state, $st.pacer.input_idle_ms, $st.pacer.others_cpu_pct)
+    Check 'threads = min(cores-1, logical/2)' ($st.model.threads -eq [math]::Max(1, [math]::Min(((Get-CimInstance Win32_Processor | Measure-Object NumberOfCores -Sum).Sum - 1), [int]([Environment]::ProcessorCount / 2)))) "threads=$($st.model.threads)"
     Check '/stats' (($st.model_state -eq 'loaded') -and ($childPid -gt 0) -and ($st.counters.requests_served -ge 4)) `
         ("pid={0} ws={1}MB private={2}MB peak_ws={3}MB peak_private={4}MB job_peak={5}MB load={6}ms served={7}" -f `
             $childPid, $st.child.working_set_mb, $st.child.private_mb, $st.child.peak_working_set_mb, `
@@ -132,6 +140,76 @@ finally {
     }
     Write-Host "runtime logs: $outLog , $errLog"
 }
+# ---------- Part 2: v0.1 memory pressure rules and the pacer ----------
+function Start-Rt([string]$name, [string]$extra) {
+    $cfg = Join-Path $logDir "smoke_$name.toml"
+    @"
+[server]
+port = $Port
+[model]
+path = '$Model'
+log_file = '$(Join-Path $logDir "smoke_$name.llama.log")'
+[budget]
+idle_unload_secs = 0
+$extra
+"@ | Set-Content -Encoding ascii $cfg
+    $p = Start-Process -FilePath $Exe -PassThru -WindowStyle Hidden -ArgumentList @('--config', "`"$cfg`"") `
+        -RedirectStandardOutput (Join-Path $logDir "smoke_$name.out.log") -RedirectStandardError (Join-Path $logDir "smoke_$name.err.log")
+    for ($i = 0; $i -lt 50; $i++) { try { Get-Json '/health' | Out-Null; break } catch { Start-Sleep -Milliseconds 200 } }
+    return $p
+}
+function Stop-Rt($p) { if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }; Start-Sleep -Milliseconds 800 }
+$long = @{ model = 'jitmo-base'; max_tokens = 400; temperature = 0; ignore_eos = $true
+    messages = @(@{ role = 'user'; content = 'Write a long story about a lighthouse.' }) }
+
+# 11. Pressure during a generation: it finishes, then the model is unloaded.
+#     (Pressure is simulated with a floor above the free RAM; critical is off.)
+$p = Start-Rt 'pressure' "pressure_free_mb = 60000`ncritical_free_mb = 0`nreserve_free_mb = 0`nwatch_interval_ms = 300"
+try {
+    $job = Start-Job -ScriptBlock { param($u, $b) Invoke-WebRequest -UseBasicParsing -Method Post -Uri $u -Body $b -ContentType 'application/json' -TimeoutSec 600 } `
+        -ArgumentList "$base/v1/chat/completions", ($long | ConvertTo-Json -Depth 5 -Compress)
+    $pendingSeen = $false
+    for ($i = 0; $i -lt 100 -and $job.State -eq 'Running'; $i++) {
+        Start-Sleep -Milliseconds 300
+        try { $st = Get-Json '/stats'; if ($st.budget.unload_pending -and $st.model_state -eq 'loaded') { $pendingSeen = $true } } catch {}
+    }
+    $res = Receive-Job $job -Wait -ErrorAction SilentlyContinue
+    $ok = $res -and ($res.StatusCode -eq 200) -and (($res.Content | ConvertFrom-Json).usage.completion_tokens -eq 400)
+    Check 'pressure: running generation finishes' $ok "pending_seen_while_generating=$pendingSeen"
+    Start-Sleep -Milliseconds 1200
+    $st = Get-Json '/stats'
+    Check 'pressure: unloaded after the generation' (($st.model_state -eq 'unloaded') -and ($st.counters.unloads.memory_pressure -ge 1)) `
+        ("state={0} unloads={1}" -f $st.model_state, ($st.counters.unloads | ConvertTo-Json -Compress))
+} finally { Stop-Rt $p }
+
+# 12. Critical memory: the running generation is aborted at once.
+$p = Start-Rt 'critical' "pressure_free_mb = 60001`ncritical_free_mb = 60000`nreserve_free_mb = 0`nwatch_interval_ms = 300"
+try {
+    $code = 0
+    try { Post '/v1/chat/completions' $long | Out-Null; $code = 200 } catch { if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode } else { $code = -1 } }
+    Start-Sleep -Milliseconds 800
+    $st = Get-Json '/stats'
+    Check 'critical: generation aborted, model unloaded' (($code -ne 200) -and ($st.counters.unloads.memory_critical -ge 1)) `
+        ("status={0} unloads={1}" -f $code, ($st.counters.unloads | ConvertTo-Json -Compress))
+} finally { Stop-Rt $p }
+
+# 13. Pacer: mode always caps the loaded child; off does not.
+$p = Start-Rt 'pacer' "[pacer]`nmode = `"always`"`nbusy_cpu_pct = 50"
+try {
+    PostJson '/v1/chat/completions' @{ model = 'jitmo-base'; max_tokens = 8; messages = @(@{ role = 'user'; content = 'Hi' }) } | Out-Null
+    Start-Sleep -Milliseconds 800
+    $st = Get-Json '/stats'
+    Check 'pacer always: child capped' (($st.pacer.state -eq 'busy') -and $st.pacer.capped -and ($null -eq $st.pacer.last_error)) `
+        ("cap={0}% of CPU err={1}" -f $st.pacer.cap_pct_of_system, $st.pacer.last_error)
+} finally { Stop-Rt $p }
+$p = Start-Rt 'pacer_off' "[pacer]`nmode = `"off`""
+try {
+    PostJson '/v1/chat/completions' @{ model = 'jitmo-base'; max_tokens = 8; messages = @(@{ role = 'user'; content = 'Hi' }) } | Out-Null
+    Start-Sleep -Milliseconds 800
+    $st = Get-Json '/stats'
+    Check 'pacer off: child not capped' ((-not $st.pacer.capped) -and ($st.pacer.state -eq 'idle')) "state=$($st.pacer.state)"
+} finally { Stop-Rt $p }
+
 if ($script:failed -gt 0) { Write-Host "$($script:failed) check(s) FAILED" -ForegroundColor Red; exit 1 }
 Write-Host 'ALL CHECKS PASSED' -ForegroundColor Green
 exit 0

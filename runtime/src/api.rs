@@ -78,6 +78,7 @@ async fn health(State(app): State<Arc<App>>) -> Json<Value> {
         "system_free_mb": sys.map(|m| mb(m.avail)),
         "requests_served": c.requests_served,
         "last_tokens_per_sec": c.last_tokens_per_sec,
+        "pacer_capped": app.sup.pacer.capped(),
         "uptime_secs": app.sup.stats.uptime_secs(),
     }))
 }
@@ -98,6 +99,8 @@ async fn stats(State(app): State<Arc<App>>) -> Json<Value> {
             "flash_attn": cfg.model.flash_attn,
             "mmap": cfg.model.mmap,
             "no_repack": cfg.model.no_repack,
+            "cache_ram_mb": cfg.model.cache_ram_mb,
+            "ctx_checkpoints": cfg.model.ctx_checkpoints,
             "adapters": sup.adapters().iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
         },
         "child": sup.child_snapshot(),
@@ -108,13 +111,22 @@ async fn stats(State(app): State<Arc<App>>) -> Json<Value> {
             "low_memory_signal": sup.low_memory_signal(),
         },
         "budget": {
-            "memory_cap_mb": cfg.budget.memory_cap_mb,
+            "memory_cap_mb": sup.plan.cap_mb(),
+            "memory_cap_source": sup.plan.source,
+            "memory_estimate_mb": sup.plan.estimate.as_ref().map(|e| json!({
+                "kv": mb(e.kv_bytes), "recurrent": mb(e.recurrent_bytes), "compute": mb(e.compute_bytes),
+                "cache_ram": mb(e.cache_ram_bytes), "checkpoints": mb(e.checkpoint_bytes), "overhead": mb(e.overhead_bytes),
+                "total": mb(e.total_bytes), "kv_layers": e.kv_layers, "swa_layers": e.swa_layers, "arch": e.arch,
+            })),
             "reserve_free_mb": cfg.budget.reserve_free_mb,
-            "load_estimate_mb": crate::budget::load_estimate_bytes(cfg) / (1024 * 1024),
+            "load_estimate_mb": crate::budget::load_estimate_bytes(cfg, &sup.plan) / (1024 * 1024),
             "pressure_free_mb": cfg.budget.pressure_free_mb,
+            "critical_free_mb": cfg.budget.critical_free_mb,
+            "unload_pending": sup.unload_pending(),
             "idle_unload_secs": cfg.budget.idle_unload_secs,
             "idle_secs": (sup.idle_secs() * 10.0).round() / 10.0,
         },
+        "pacer": sup.pacer.snapshot(sup.phase() == crate::supervisor::Phase::Loaded),
         "queue": { "generating": sup.generating(), "waiting": sup.waiting(), "max_queue": cfg.server.max_queue },
         "counters": sup.stats.counters(),
     }))
