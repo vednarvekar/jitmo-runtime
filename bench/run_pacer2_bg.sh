@@ -10,7 +10,8 @@ REPS=${1:-3}
 P=${PDIR:-$OUT/pacer2}
 mkdir -p "$P"
 $PY "$B/ramlog.py" "$P/ram.jsonl" 7200 & RAMPID=$!  # free RAM once a second
-trap 'kill $RAMPID 2>/dev/null' EXIT
+start_proclog "$P/procs.jsonl" 7200
+trap 'kill $RAMPID $PROCPID 2>/dev/null' EXIT
 s=$(powershell -NoProfile -c "Add-Type -AssemblyName System.Windows.Forms; \$p=[System.Windows.Forms.SystemInformation]::PowerStatus; '{0} {1}' -f \$p.PowerLineStatus, \$p.BatteryLifePercent" | tr -d '\r')
 echo "$(date '+%F %T') power: $s (pacer2 bgonly)" | tee -a "$OUT/power.log"
 case "$s" in Online*) ;; *) [ "${ALLOW_BATTERY:-0}" = 1 ] || { echo "not on AC"; exit 9; } ;; esac
@@ -32,7 +33,7 @@ EOF
 "$RT" --config "$(cygpath -w "$P/rt_bgonly.toml")" > "$P/rt_bgonly.out.log" 2>&1 &
 RPID=$!
 until curl -s "http://127.0.0.1:$PORT/health" | grep -q '"ok"'; do sleep 0.5; done
-curl -s -X POST "http://127.0.0.1:$PORT/admin/load" | grep -q '"loaded":true' || { echo "LOAD FAILED"; kill $RPID; exit 3; }
+load_retry $PORT || { echo "LOAD FAILED"; kill $RPID; exit 3; }
 
 sample() { # out secs
   for i in $(seq 1 $2); do

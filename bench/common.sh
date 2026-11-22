@@ -21,3 +21,23 @@ power_check() {
     *) echo "POWER NOT ONLINE - stopping"; exit 9 ;;
   esac
 }
+
+# Log the concurrent jitmo audit run (process count, CPU, RAM) once a second into $1, for $2 seconds.
+# Sets PROCPID; kill it when done (scripts do this in their EXIT trap).
+start_proclog() {
+  powershell -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w "$B/proclog.ps1")" -Out "$(cygpath -w "$1")" -Secs ${2:-3600} > /dev/null 2>&1 &
+  PROCPID=$!
+}
+
+# POST /admin/load on port $1, retrying every 10 s for up to 2 minutes while the runtime refuses for
+# free RAM (other apps' RAM moves a lot). Returns 0 once loaded. Logs each refusal.
+load_retry() {
+  local i r
+  for i in $(seq 1 12); do
+    r=$(curl -s -X POST "http://127.0.0.1:$1/admin/load")
+    echo "$r" | grep -q '"loaded":true' && return 0
+    echo "$(date '+%T') load refused (try $i): $r"
+    sleep 10
+  done
+  return 1
+}

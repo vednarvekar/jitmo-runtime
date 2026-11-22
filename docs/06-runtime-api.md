@@ -581,7 +581,7 @@ Adapters are loaded with their model (`adapters = [...]` in the model, plus ever
 - The pacer has one lever, a CPU cap per child. It cannot change threads per request and does not pause between tokens. Its signals are CPU and free RAM; memory-bandwidth contention is not measured yet.
 - The load estimate counts the whole prompt cache (`cache_ram_mb`, 256 MB), so for a small model that is used little it is about twice the real use. Override it with `load_estimate_mb` per model, or lower `cache_ram_mb`.
 - The memory cap does not cover memory-mapped weights, and the automatic cap does not cover a repacked copy (`no_repack = false`).
-- Memory pressure waits for a running generation (or chain) for at most `pressure_finish_max_ms` (15 s), then cancels it. The time limit is tested by unit tests only, not yet in a real low-RAM run.
+- Memory pressure waits for a running generation (or chain) for at most `pressure_finish_max_ms` (15 s), then cancels it. Measured in a real low-RAM run: it cancels after 15 to 17 s (the watchdog checks once a second), see [results/07-v0.3-low-ram.md](results/07-v0.3-low-ram.md).
 - A model that is loading cannot be cancelled; cancelling its request lets the load finish.
 - Windows only (Job Objects, Win32 memory and CPU APIs).
 
@@ -590,4 +590,5 @@ Adapters are loaded with their model (`adapters = [...]` in the model, plus ever
 - v0.2 (child mode, cancel, priority, pool switching, embeddings, LoRA, cold load, load estimate): [results/04-v0.2.md](results/04-v0.2.md).
 - Pacer v2: [results/05-pacer-v2.md](results/05-pacer-v2.md).
 - Low free RAM (loading, pacer at 15% vs 20%, memory-pressure unload): [results/06-low-ram.md](results/06-low-ram.md).
+- v0.3 under low free RAM (load estimates, pacer, forced 4B, 15 s pressure limit): [results/07-v0.3-low-ram.md](results/07-v0.3-low-ram.md).
 - v0.1: Gemma 3n vs Qwen3-4B [results/02-gemma3n.md](results/02-gemma3n.md); pacer v1 [results/03-pacer-v1.md](results/03-pacer-v1.md); v0 baseline numbers [results/01-baseline.md](results/01-baseline.md).

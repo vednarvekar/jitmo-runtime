@@ -2,6 +2,7 @@
 # Memory-pressure path: Gemma 3n generates through jitmo-runtime (default budget: pressure 1024 MB
 # twice in a row = finish, then unload; critical 500 MB once = unload at once), while memhog.py
 # lowers free RAM to TARGET MB and holds it. Logs /stats once a second.
+# A foreground probe (8 s + 8 s) runs while memhog holds. HOLD=<s> (default 30).
 # Usage: bash run_lowram_pressure.sh <target_free_mb> [tag]
 source /v/Code/jitmo-runtime/bench/common.sh
 PY="python -I"
@@ -11,6 +12,10 @@ TARGET=$1
 TAG=${2:-t$1}
 P=${PDIR:-$OUT/lowram/pressure}
 mkdir -p "$P"
+$PY "$B/ramlog.py" "$P/${TAG}_ram.jsonl" 900 & RAMPID=$!
+start_proclog "$P/${TAG}_procs.jsonl" 900
+HOGPID=
+trap 'kill $RAMPID $PROCPID $HOGPID 2>/dev/null' EXIT
 power_check "lowram pressure $TAG"
 cat > "$P/rt_$TAG.toml" <<EOF
 [server]
@@ -38,7 +43,12 @@ SPID=$!
 $PY "$B/stream_client.py" --chat --port $PORT --n 600 --out "$P/${TAG}_tokens.json" > "$P/${TAG}_client.txt" 2>&1 &
 CPID=$!
 sleep 8
-$PY "$B/memhog.py" $TARGET 25 300 > "$P/${TAG}_memhog.jsonl" 2>&1
+$PY "$B/memhog.py" $TARGET ${HOLD:-30} 300 > "$P/${TAG}_memhog.jsonl" 2>&1 &
+HOGPID=$!
+# foreground probe while RAM is short: is the PC still responsive?
+for i in $(seq 1 60); do grep -q '"holding": true' "$P/${TAG}_memhog.jsonl" 2>/dev/null && break; sleep 1; done
+"$BIN/probe.exe" --secs 8 --tag ${TAG}_probe > "$P/${TAG}_probe.txt" 2>&1
+wait $HOGPID
 for i in $(seq 1 60); do kill -0 $CPID 2>/dev/null || break; sleep 1; done
 kill $CPID 2>/dev/null; wait $CPID 2>/dev/null
 sleep 5

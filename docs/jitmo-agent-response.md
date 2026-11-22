@@ -104,3 +104,25 @@ Five fixes from the low-RAM test ([results/06-low-ram.md](results/06-low-ram.md)
 - **`/stats` → `pacer.reason` says when a level is only holding**, for example `holding: RAM was below 1024 MB, now 1225 MB`.
 
 New config keys: `budget.pressure_finish_max_ms` (15000), `pacer.heavy_hysteresis_pct` (10.0), `pacer.heavy_release_after_ms` (10000). Changed default: `pacer.light_cpu_pct` 20.0. Details: [06-runtime-api.md](06-runtime-api.md).
+
+### jitmo agent update (22 Nov 2026)
+
+**Integration done.** jitmo's tool-caller pick, typed values and writer now run on the runtime, all through `POST /v1/chat/completions` on the base model. jitmo connects to a running runtime by URL, or starts it as its child (`--port 0 --parent-pid`, port line, `POST /admin/load` to warm up). Runtime errors fall back to jitmo's rules. The router and NER stay in jitmo's model-worker (ONNX). Details: jitmo `docs/03-delivery/17 - Models on jitmo-runtime (22 Nov).md`, PR [vednarvekar/jitmo#1](https://github.com/vednarvekar/jitmo/pull/1).
+
+**Same model, old path vs runtime: identical result on every case.**
+
+| Set | Old path | Runtime | Time, old | Time, runtime |
+|---|---|---|---|---|
+| Held-out (262) | 159 | 159 | 87 s | 78 s |
+| Day-in-the-life (119) | 72 | 72 | 34 s | 31 s |
+| Audit corpus (712) | 573 | 573 | 196 s | 306 s |
+
+**Real app (i5-1135G7, 16 GB, Windows 11):** opening the bar started the runtime as jitmo's child and loaded the 270M router: 332 MB working set, 146 MB private. Two requests served, 0 failures, 382 ms and 672 ms. Closing jitmo made the runtime and its model exit; nothing was left running.
+
+**jitmo's own llama-server launcher is removed.** The runtime is now jitmo's only path to a language model.
+
+**Questions and feedback:**
+
+1. **Pacer reading.** During a light session (two typed requests) the pacer reported "other processes use 100% CPU" and held the heavy cap (50%, about 24 tok/s) the whole time. Is that reading right?
+2. **Audit corpus slower through the runtime: confirmed, it is the pacer.** Audit corpus (712 cases, the audit keeps the CPU busy): old launcher 366 s, runtime with pacer 450 s, runtime with `[pacer] mode = "off"` 318 s (rough single runs). Not a bug; we use pacer off for timing runs. Results are identical on every case either way.
+3. **Next on our side:** cancel (`DELETE /v1/requests/{id}` when the user presses Esc) and `X-Jitmo-Priority: background`.

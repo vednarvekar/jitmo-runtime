@@ -16,7 +16,8 @@ CONDS=${*:-"alone off adaptive bgload"}
 P=${PDIR:-$OUT/pacer2}
 mkdir -p "$P"
 $PY "$B/ramlog.py" "$P/ram.jsonl" 7200 & RAMPID=$!  # free RAM once a second
-trap 'kill $RAMPID 2>/dev/null' EXIT
+start_proclog "$P/procs.jsonl" 7200
+trap 'kill $RAMPID $PROCPID 2>/dev/null' EXIT
 
 power() {
   if [ "${ALLOW_BATTERY:-0}" = 1 ]; then
@@ -71,7 +72,7 @@ for C in $CONDS; do
   "$RT" --config "$(cygpath -w "$P/rt_$C.toml")" > "$P/rt_$C.out.log" 2>&1 &
   RPID=$!
   until curl -s "http://127.0.0.1:$PORT/health" | grep -q '"ok"'; do sleep 0.5; done
-  curl -s -X POST "http://127.0.0.1:$PORT/admin/load" | grep -q '"loaded":true' || { echo "LOAD FAILED for $C"; kill $RPID; exit 3; }
+  load_retry $PORT || { echo "LOAD FAILED for $C"; kill $RPID; exit 3; }
   for r in $(seq 1 $REPS); do
     power "pacer2 $C r$r"
     BGPID=

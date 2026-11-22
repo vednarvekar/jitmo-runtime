@@ -1,0 +1,26 @@
+# Runtime config for the quality run (docs/quality-test.md). One model at a time is enough:
+# run_quality.py warms the model it tests with POST /admin/load, and the pool budget makes the
+# runtime evict the other big model first. Same defaults as runtime/jitmo-runtime.toml otherwise.
+
+[server]
+port = 8090
+
+[budget]
+pool_budget_mb = 4000      # Gemma 3n (~2.3 GB) and Qwen3-4B (~3.5 GB) never loaded together
+
+[[models]]
+name = "gemma3n"
+path = 'V:\jitmo-sandbox\models\gemma-3n-E2B-it-Q4_K_M.gguf'
+ctx_size = 4096
+
+[[models]]
+name = "qwen3-4b"
+path = 'V:\jitmo-sandbox\models\Qwen3-4B-Instruct-2507-Q4_K_M.gguf'
+ctx_size = 4096
+chat_template_kwargs = { enable_thinking = false }
+
+[[models]]
+name = "qwen35-08b"
+path = 'V:\jitmo-sandbox\models\Qwen3.5-0.8B-Q4_K_M.gguf'
+ctx_size = 4096
+chat_template_kwargs = { enable_thinking = false }

@@ -51,6 +51,7 @@ t_send = time.time() * 1000
 stamps = []
 timings = None
 text = []
+error = None  # an error event in the stream (e.g. 503 memory_pressure from jitmo-runtime)
 # Write partial results as we go so a killed client still leaves data.
 with urllib.request.urlopen(req, timeout=3600) as r:
     for raw in r:
@@ -62,6 +63,8 @@ with urllib.request.urlopen(req, timeout=3600) as r:
             break
         d = json.loads(payload)
         now = time.time() * 1000
+        if d.get("error"):
+            error = {"t_ms": now, "error": d["error"]}
         if a.chat:
             ch = (d.get("choices") or [{}])[0]
             c = (ch.get("delta") or {}).get("content")
@@ -82,5 +85,5 @@ with urllib.request.urlopen(req, timeout=3600) as r:
                 json.dump({"t_send_ms": t_send, "t_ms": stamps, "timings": None, "partial": True}, f)
 with open(a.out, "w") as f:
     json.dump({"t_send_ms": t_send, "t_ms": stamps, "timings": timings, "partial": False,
-               "text_head": "".join(text)[:300]}, f)
-print(json.dumps({"tokens": len(stamps), "timings": timings}))
+               "text_head": "".join(text)[:300], "error": error}, f)
+print(json.dumps({"tokens": len(stamps), "timings": timings, "error": error}))
