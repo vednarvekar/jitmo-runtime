@@ -70,3 +70,25 @@ These calls go straight to the base model, not through a chain. Chains take one 
 Suggested order, once the owner confirms: 7, 6, 4, 5 (small and unblocks you), then 2, then 3 and 1 (bigger). We'll post updates under this section.
 
 **Update, 21 Nov 2026:** the owner confirmed. These become **runtime v0.2**, in that order, and start as soon as v0.1 is finished.
+
+### v0.2 delivered (22 Nov 2026)
+
+All eight needs above are now in the runtime, except token tagging (NER), which stays in model-worker. Full reference: [06-runtime-api.md](06-runtime-api.md); measurements: [results/04-v0.2.md](results/04-v0.2.md), [results/05-pacer-v2.md](results/05-pacer-v2.md).
+
+| # | Need | How to use it now |
+|---|---|---|
+| 7 | Child process | `jitmo-runtime.exe --config <toml> --port 0 --parent-pid <your pid> --port-file <file> --log-file <file>`. stdout carries one line, `JITMO_RUNTIME_LISTENING port=<n>`. When your process exits, the runtime stops its models and exits (73 ms measured). |
+| 6 | Warm-up | `POST /admin/load` with `{"model": "<name>"}` (or no body for the default model). Returns when the model is ready, or `503 insufficient_memory` / `model_load_failed`. |
+| 4 | Cancel | Every chat, chain and embeddings response has `X-Jitmo-Request-Id`. Send your own id in that header to know it up front (needed for non-streamed requests, whose headers come at the end). `DELETE /v1/requests/{id}`: a queued request leaves the queue, a running one stops in llama-server (checked in its log and CPU). The client gets `499 request_cancelled` (streams: an error event, then `[DONE]`). **Closing the connection also stops llama-server**, streamed or not. |
+| 5 | Priority | Header `X-Jitmo-Priority: interactive` (default) or `background`. Waiting interactive requests run first; a running request is not interrupted. |
+| 2 | Chains with several inputs | `POST /v1/chains/{name}/run` with `{"vars": {"question": "...", "passage": "..."}, "system": {"<step>": "..."}}`; templates use `{question}`, `{passage}`. The old `{"input": "..."}` still works. Missing variables are refused before anything runs. |
+| 3 | Several models | `[[models]]` entries (name, path, kind, ctx_size, threads, pinned, ...). Requests pick a model with `model`; chain steps with `model = "..."`. `budget.pool_budget_mb` bounds all loaded models together; least recently used idle, unpinned models are evicted; a generating model never is. One generation at a time across the pool (`server.max_concurrent = 1`). Switch cost measured with your 270M router + Gemma 3n E2B: ~0 when both stay loaded, about 1.2 s (router) / 1.9 s (Gemma 3n) when one must be reloaded. |
+| 1 | Encoder models | `kind = "embedding"` models and `POST /v1/embeddings` (OpenAI format). Tested with all-MiniLM-L6-v2 Q8_0 (now in `V:\jitmo-sandbox\models\`): 384 dims, normalized, 3.8 ms per short input. **Please compare its vectors with your ONNX MiniLM before moving the router.** Classification heads and NER: still not supported. |
+| 8 | LoRA and cold loads | Model `adapters = [...]`, per request `"lora": [{"id": 0, "scale": 1.0}]`; scale switches per request with no reload (tested with a synthetic adapter; a trained one is untested). A llama.cpp quirk was found and fixed: an adapter a request does not name used to stay on at scale 1. Cold load from the SSD: +0.3 to 0.7 s for 2.4 to 2.8 GB models; load time itself varies 2 to 7 s. |
+
+Also changed, which may affect your plan:
+
+- **Logs go to stderr** (or `--log-file`), not stdout.
+- **The RAM check before a load** is less strict: Gemma 3n is estimated at 2.7 GB instead of 4.1 GB (its Per-Layer Embeddings stay on disk). For the 270M router it is still 1.2 GB (a fixed 640 MiB overhead); if your 1.2 GB rule needs it, set `load_estimate_mb` on that model. Its real use is about 330 MB working set, 140 MB private.
+- **Pacer v2:** the keyboard/mouse signal is gone. The model is capped to 75% of its CPU when other programs use 15 to 40% of the CPU, and to 50% above 40% or when RAM is short. `/stats` → `pacer.level` and `reason`.
+- `/v1/models` entries have a `kind` field; `/health` and `/stats` list every model. The v0.1 top-level fields are still there, for the default model.

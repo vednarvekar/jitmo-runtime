@@ -1,13 +1,13 @@
-//! RAM budget: the child's memory cap, may the model start now, is the system short of
-//! memory, and how many threads.
+//! RAM budget: each child's memory cap, what a loaded model is expected to take, is the
+//! system short of memory, and how many threads.
 
-use crate::config::{Config, MemoryCap, ModelConfig};
+use crate::config::{BudgetConfig, Config, MemoryCap, ModelConfig};
 use crate::gguf::Gguf;
 use crate::win::{self, LowMemorySignal};
 use serde::Serialize;
 
 const MB: u64 = 1024 * 1024;
-/// Private memory assumed when there is no cap (KV cache, compute buffers, overhead).
+/// Private memory assumed when there is no cap and no estimate (KV cache, buffers, overhead).
 const UNCAPPED_PRIVATE: u64 = 1024 * MB;
 /// Cap used when `memory_cap_mb = "auto"` but the GGUF metadata cannot be read.
 const FALLBACK_CAP: u64 = 1536 * MB;
@@ -16,8 +16,11 @@ const FALLBACK_CAP: u64 = 1536 * MB;
 /// Qwen3-4B 128 MiB, Gemma 3n E2B 180 MiB, Qwen3.5-0.8B 517 MiB. 640 MiB covers all three
 /// with room for the growth seen during generation.
 pub const CAP_OVERHEAD: u64 = 640 * MB;
-/// llama-server's default physical batch (`-ub`); the compute buffers scale with it.
+/// llama-server's default physical batch (`-ub`); sliding-window KV is sized to window + this.
 const N_UBATCH: u64 = 512;
+/// Tensors that stay on disk: llama.cpp reads only the rows of the tokens it sees. Gemma 3n's
+/// Per-Layer Embeddings are about half of its file (results/02-gemma3n.md).
+pub const ON_DISK_TENSORS: &[&str] = &["per_layer_token_embd"];
 
 /// Bytes per element of a KV cache type (block types: bytes per block / 32 elements).
 fn kv_type_bytes(ty: &str) -> f64 {
@@ -49,9 +52,9 @@ pub struct MemoryEstimate {
     pub recurrent_bytes: u64,
     /// Compute buffers: 16 x ubatch x (max FFN width + embedding width x altup inputs).
     pub compute_bytes: u64,
-    /// `model.cache_ram_mb`.
+    /// `cache_ram_mb`.
     pub cache_ram_bytes: u64,
-    /// `model.ctx_checkpoints` x (SWA KV + recurrent state), only for SWA/hybrid models.
+    /// `ctx_checkpoints` x (SWA KV + recurrent state), only for SWA/hybrid models.
     pub checkpoint_bytes: u64,
     pub overhead_bytes: u64,
     /// Sum of all parts, rounded up to 64 MiB: the automatic memory cap.
@@ -124,7 +127,7 @@ impl MemoryEstimate {
 
         let n_ff = (0..n_layer).filter_map(|il| g.per_layer("feed_forward_length", il)).fold(0.0, f64::max);
         let altup = g.num("altup.num_inputs").unwrap_or(1.0).max(1.0);
-        est.compute_bytes = (16.0 * N_UBATCH as f64 * (n_ff + n_embd * altup)) as u64;
+        est.compute_bytes = (16.0 * m.ubatch() as f64 * (n_ff + n_embd * altup)) as u64;
         est.cache_ram_bytes = m.cache_ram_mb * MB;
         if est.swa_kv_bytes > 0 || est.recurrent_bytes > 0 {
             est.checkpoint_bytes = m.ctx_checkpoints as u64 * (est.swa_kv_bytes + est.recurrent_bytes);
@@ -136,7 +139,7 @@ impl MemoryEstimate {
     }
 }
 
-/// The memory cap in force for this runtime, decided once at startup.
+/// The memory plan of one model, decided once at startup: its commit cap and its load estimate.
 #[derive(Debug, Clone, Serialize)]
 pub struct MemPlan {
     /// Commit cap on the child in bytes; None = no cap.
@@ -144,61 +147,114 @@ pub struct MemPlan {
     /// `auto`, `config` (explicit number), `none` (0), or `fallback` (auto, but the GGUF could not be read).
     pub source: &'static str,
     pub estimate: Option<MemoryEstimate>,
+    pub load: LoadEstimate,
+}
+
+/// RAM the model is expected to take once loaded: what the free-RAM check and the pool budget use.
+///
+/// `total = private + mapped (+ mapped again without --no-repack)`, where
+/// - `private` = the automatic cap (KV + state + buffers + caches + overhead), or the cap from
+///   the config when one is set, or 1024 MiB if there is neither;
+/// - `mapped` = the part of the memory-mapped file expected to be resident: the whole file,
+///   minus tensors llama.cpp leaves on disk (`ON_DISK_TENSORS`).
+///
+/// With repacking on, the CPU backend copies the weights into private memory too, so they
+/// count twice. A number in `load_estimate_mb` replaces the whole estimate.
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct LoadEstimate {
+    pub file_bytes: u64,
+    pub private_bytes: u64,
+    pub mapped_bytes: u64,
+    /// (tensor prefix, bytes) left out of `mapped_bytes`.
+    pub on_disk: Vec<(String, u64)>,
+    pub repack_bytes: u64,
+    pub total_bytes: u64,
+    /// `estimate` or `config` (load_estimate_mb).
+    pub source: &'static str,
 }
 
 impl MemPlan {
-    pub fn new(cfg: &Config) -> MemPlan {
-        let estimate = match Gguf::read(&cfg.model.path) {
-            Ok(g) => {
-                let e = MemoryEstimate::from_gguf(&g, &cfg.model);
-                if e.is_none() {
-                    tracing::warn!("GGUF metadata lacks block_count/embedding_length; cannot estimate the model's memory");
-                }
-                e
-            }
+    pub fn new(m: &ModelConfig, b: &BudgetConfig) -> MemPlan {
+        let file_bytes = std::fs::metadata(&m.path).map_or(0, |f| f.len());
+        let gguf = match Gguf::read(&m.path) {
+            Ok(g) => Some(g),
             Err(e) => {
                 tracing::warn!("{e:#}");
                 None
             }
         };
-        MemPlan::decide(cfg.budget.memory_cap_mb, estimate)
+        let estimate = gguf.as_ref().and_then(|g| {
+            let e = MemoryEstimate::from_gguf(g, m);
+            if e.is_none() {
+                tracing::warn!("model '{}': GGUF metadata lacks block_count/embedding_length; cannot estimate its memory", m.name);
+            }
+            e
+        });
+        let on_disk: Vec<(String, u64)> = gguf
+            .as_ref()
+            .map(|g| ON_DISK_TENSORS.iter().map(|p| (p.to_string(), g.tensor_bytes(p))).filter(|(_, n)| *n > 0).collect())
+            .unwrap_or_default();
+        let override_mb = m.load_estimate_mb.unwrap_or(b.load_estimate_mb);
+        MemPlan::decide(m.memory_cap_mb.unwrap_or(b.memory_cap_mb), estimate, file_bytes, on_disk, m.no_repack, override_mb)
     }
 
-    pub fn decide(setting: MemoryCap, estimate: Option<MemoryEstimate>) -> MemPlan {
-        match (setting, &estimate) {
-            (MemoryCap::Mb(0), _) => MemPlan { cap_bytes: None, source: "none", estimate },
-            (MemoryCap::Mb(n), _) => MemPlan { cap_bytes: Some(n * MB), source: "config", estimate },
-            (MemoryCap::Auto, Some(e)) => MemPlan { cap_bytes: Some(e.total_bytes), source: "auto", estimate },
-            (MemoryCap::Auto, None) => MemPlan { cap_bytes: Some(FALLBACK_CAP), source: "fallback", estimate },
+    pub fn decide(
+        setting: MemoryCap,
+        estimate: Option<MemoryEstimate>,
+        file_bytes: u64,
+        on_disk: Vec<(String, u64)>,
+        no_repack: bool,
+        load_estimate_mb: u64,
+    ) -> MemPlan {
+        let (cap_bytes, source) = match (setting, &estimate) {
+            (MemoryCap::Mb(0), _) => (None, "none"),
+            (MemoryCap::Mb(n), _) => (Some(n * MB), "config"),
+            (MemoryCap::Auto, Some(e)) => (Some(e.total_bytes), "auto"),
+            (MemoryCap::Auto, None) => (Some(FALLBACK_CAP), "fallback"),
+        };
+        let private_bytes = match (source, &estimate) {
+            ("config" | "fallback", _) => cap_bytes.unwrap_or(0),
+            (_, Some(e)) => e.total_bytes,
+            (_, None) => UNCAPPED_PRIVATE,
+        };
+        let excluded: u64 = on_disk.iter().map(|(_, n)| n).sum();
+        let mapped_bytes = file_bytes.saturating_sub(excluded);
+        let repack_bytes = if no_repack { 0 } else { mapped_bytes };
+        let mut load = LoadEstimate {
+            file_bytes,
+            private_bytes,
+            mapped_bytes,
+            on_disk,
+            repack_bytes,
+            total_bytes: private_bytes + mapped_bytes + repack_bytes,
+            source: "estimate",
+        };
+        if load_estimate_mb > 0 {
+            load.total_bytes = load_estimate_mb * MB;
+            load.source = "config";
         }
+        MemPlan { cap_bytes, source, estimate, load }
     }
 
     pub fn cap_mb(&self) -> u64 {
         self.cap_bytes.unwrap_or(0) / MB
     }
-}
 
-/// RAM the loaded model is expected to take: the mmap'd weights (about the file size) plus
-/// private memory, which the commit cap bounds.
-pub fn load_estimate_bytes(cfg: &Config, plan: &MemPlan) -> u64 {
-    if cfg.budget.load_estimate_mb > 0 {
-        return cfg.budget.load_estimate_mb * MB;
+    pub fn load_bytes(&self) -> u64 {
+        self.load.total_bytes
     }
-    std::fs::metadata(&cfg.model.path).map_or(0, |m| m.len()) + plan.cap_bytes.unwrap_or(UNCAPPED_PRIVATE)
 }
 
-/// Ok if starting the model would leave at least `reserve_free_mb` free; otherwise the reason.
-pub fn check_before_load(cfg: &Config, plan: &MemPlan) -> Result<(), String> {
+/// Ok if loading `need` bytes would leave at least `reserve_free_mb` free; otherwise the reason.
+pub fn check_free_ram(need: u64, reserve_free_mb: u64) -> Result<(), String> {
     let Some(mem) = win::memory_status() else {
         tracing::warn!("cannot read free RAM; starting the model without the budget check");
         return Ok(());
     };
-    let need = load_estimate_bytes(cfg, plan);
-    let reserve = cfg.budget.reserve_free_mb * MB;
+    let reserve = reserve_free_mb * MB;
     if mem.avail < need + reserve {
         return Err(format!(
-            "not enough free RAM to start the model: {} MB free, the model needs about {} MB and {} MB must stay free \
-             (budget.load_estimate_mb / budget.reserve_free_mb). Close some apps and try again.",
+            "{} MB free, the model needs about {} MB and {} MB must stay free (budget.reserve_free_mb)",
             mem.avail / MB,
             need / MB,
             reserve / MB
@@ -211,7 +267,7 @@ pub fn check_before_load(cfg: &Config, plan: &MemPlan) -> Result<(), String> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum MemoryAction {
     None,
-    /// Short of memory, but not critically: finish the running generation, then unload.
+    /// Short of memory, but not critically: finish running generations, then unload.
     UnloadWhenFree(String),
     /// Unload at once, even mid-generation.
     UnloadNow(String),
@@ -262,9 +318,9 @@ pub fn default_threads() -> u32 {
     default_threads_for(physical, logical)
 }
 
-pub fn threads(cfg: &Config) -> u32 {
-    if cfg.model.threads > 0 {
-        cfg.model.threads
+pub fn threads(m: &ModelConfig) -> u32 {
+    if m.threads > 0 {
+        m.threads
     } else {
         default_threads()
     }
@@ -294,21 +350,35 @@ mod tests {
         assert_eq!(default_threads_for(1, 2), 1);
         let d = default_threads();
         assert!(d >= 1 && d <= logical_processors() / 2 + 1);
-        let mut cfg = Config::default();
-        cfg.model.threads = 6;
-        assert_eq!(threads(&cfg), 6);
+        let m = ModelConfig { threads: 6, ..Default::default() };
+        assert_eq!(threads(&m), 6);
     }
 
     #[test]
     fn an_impossible_reserve_refuses_the_load() {
-        let mut cfg = Config::default();
-        let plan = MemPlan::decide(MemoryCap::Mb(0), None);
-        cfg.budget.load_estimate_mb = 1;
-        cfg.budget.reserve_free_mb = 1 << 30; // 1 PB
-        let err = check_before_load(&cfg, &plan).unwrap_err();
-        assert!(err.contains("not enough free RAM"));
-        cfg.budget.reserve_free_mb = 0;
-        assert!(check_before_load(&cfg, &plan).is_ok());
+        let err = check_free_ram(MB, 1 << 30).unwrap_err(); // 1 PB reserve
+        assert!(err.contains("must stay free"), "{err}");
+        assert!(check_free_ram(MB, 0).is_ok());
+    }
+
+    #[test]
+    fn the_load_estimate_leaves_on_disk_tensors_out() {
+        let e = MemoryEstimate { total_bytes: 1216 * MB, ..Default::default() };
+        // Gemma 3n E2B: 2887 MiB file, 1440 MiB of Per-Layer Embeddings.
+        let ple = vec![("per_layer_token_embd".to_string(), 1440 * MB)];
+        let p = MemPlan::decide(MemoryCap::Auto, Some(e.clone()), 2887 * MB, ple.clone(), true, 0);
+        assert_eq!(p.load.mapped_bytes, 1447 * MB);
+        assert_eq!(p.load_bytes(), (1216 + 1447) * MB, "v0.1 counted 2887 + 1216");
+        // Repacking copies the mapped weights into private memory.
+        let r = MemPlan::decide(MemoryCap::Auto, Some(e.clone()), 2887 * MB, ple, false, 0);
+        assert_eq!(r.load_bytes(), (1216 + 2 * 1447) * MB);
+        // A configured cap is the private part; no cap and no estimate = 1024 MiB.
+        let c = MemPlan::decide(MemoryCap::Mb(900), Some(e.clone()), 100 * MB, vec![], true, 0);
+        assert_eq!(c.load.private_bytes, 900 * MB);
+        let n = MemPlan::decide(MemoryCap::Mb(0), None, 100 * MB, vec![], true, 0);
+        assert_eq!(n.load_bytes(), 1124 * MB);
+        let o = MemPlan::decide(MemoryCap::Auto, Some(e), 100 * MB, vec![], true, 777);
+        assert_eq!((o.load_bytes(), o.load.source), (777 * MB, "config"));
     }
 
     /// The KV and recurrent sizes must match what llama.cpp build 12248 printed for the real
@@ -388,32 +458,39 @@ mod tests {
         let m = ModelConfig::default();
         let dir = std::path::Path::new(r"V:\jitmo-sandbox\models");
         let cases = [
-            ("Qwen3-4B-Instruct-2507-Q4_K_M.gguf", 576.0, 0.0, 1600.0),
-            ("Qwen3.5-0.8B-Q4_K_M.gguf", 48.0, 19.27, 1088.0),
-            ("gemma-3n-E2B-it-Q4_K_M.gguf", 64.0, 0.0, 1216.0),
+            ("Qwen3-4B-Instruct-2507-Q4_K_M.gguf", 576.0, 0.0, 1600.0, 0.0),
+            ("Qwen3.5-0.8B-Q4_K_M.gguf", 48.0, 19.27, 1088.0, 0.0),
+            ("gemma-3n-E2B-it-Q4_K_M.gguf", 64.0, 0.0, 1216.0, 1440.0),
         ];
-        for (file, kv, rs, total) in cases {
+        for (file, kv, rs, total, ple) in cases {
             let path = dir.join(file);
             if !path.is_file() {
                 eprintln!("skipped: {} not found", path.display());
                 continue;
             }
-            let e = MemoryEstimate::from_gguf(&Gguf::read(&path).unwrap(), &m).unwrap();
+            let g = Gguf::read(&path).unwrap();
+            let e = MemoryEstimate::from_gguf(&g, &m).unwrap();
             assert_eq!(mib(e.kv_bytes), kv, "{file}");
             assert!((mib(e.recurrent_bytes) - rs).abs() < 0.01, "{file}");
             assert_eq!(mib(e.total_bytes), total, "{file}");
             assert!(e.n_vocab > 100_000, "{file}");
+            // The tensor sizes add up to the file, and Gemma 3n's PLE table is 1440 MiB.
+            let data: u64 = g.tensors.iter().map(|t| t.1).sum();
+            let len = std::fs::metadata(&path).unwrap().len();
+            assert!(data < len && len - data < 16 * MB, "{file}: tensors {data} of {len} bytes");
+            assert!((mib(g.tensor_bytes("per_layer_token_embd")) - ple).abs() < 1.0, "{file}");
         }
     }
 
     #[test]
     fn the_cap_setting_picks_the_source() {
         let e = MemoryEstimate { total_bytes: 1600 * MB, ..Default::default() };
-        let p = MemPlan::decide(MemoryCap::Auto, Some(e.clone()));
+        let d = |c, e| MemPlan::decide(c, e, 0, vec![], true, 0);
+        let p = d(MemoryCap::Auto, Some(e.clone()));
         assert_eq!((p.cap_mb(), p.source), (1600, "auto"));
-        assert_eq!(MemPlan::decide(MemoryCap::Mb(900), Some(e.clone())).cap_mb(), 900);
-        assert_eq!(MemPlan::decide(MemoryCap::Mb(0), Some(e)).cap_bytes, None);
-        assert_eq!(MemPlan::decide(MemoryCap::Auto, None).source, "fallback");
+        assert_eq!(d(MemoryCap::Mb(900), Some(e.clone())).cap_mb(), 900);
+        assert_eq!(d(MemoryCap::Mb(0), Some(e)).cap_bytes, None);
+        assert_eq!(d(MemoryCap::Auto, None).source, "fallback");
     }
 
     #[test]

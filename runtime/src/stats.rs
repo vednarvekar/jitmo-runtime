@@ -11,8 +11,12 @@ const RECENT: usize = 20;
 /// Timing of one generation (one chat request, or one chain step).
 #[derive(Debug, Clone, Serialize)]
 pub struct RequestTiming {
-    /// `chat`, `chat_stream` or `chain_step`.
+    /// `chat`, `chat_stream`, `chain_step` or `embedding`.
     pub kind: &'static str,
+    /// The request's id (`X-Jitmo-Request-Id`).
+    pub request_id: String,
+    /// The model that ran it.
+    pub model: String,
     /// Model name, or `chain/step`.
     pub label: String,
     /// Time spent waiting for the one generation slot.
@@ -45,6 +49,8 @@ impl RequestTiming {
         let rate = |n: u64, ms: f64| (ms > 0.0 && n > 0).then(|| round2(n as f64 * 1000.0 / ms));
         RequestTiming {
             kind,
+            request_id: String::new(),
+            model: String::new(),
             label,
             queue_ms: round2(queue_ms),
             load_ms: round2(load_ms),
@@ -62,6 +68,14 @@ impl RequestTiming {
     }
 }
 
+impl RequestTiming {
+    pub fn with_ids(mut self, request_id: &str, model: &str) -> RequestTiming {
+        self.request_id = request_id.to_string();
+        self.model = model.to_string();
+        self
+    }
+}
+
 pub fn round2(x: f64) -> f64 {
     (x * 100.0).round() / 100.0
 }
@@ -75,6 +89,8 @@ pub enum UnloadReason {
     Idle,
     MemoryPressure,
     MemoryCritical,
+    /// Made room for another model (pool budget or free RAM).
+    Evicted,
     Admin,
     Crashed,
     Shutdown,
@@ -86,6 +102,7 @@ impl UnloadReason {
             UnloadReason::Idle => "idle",
             UnloadReason::MemoryPressure => "memory_pressure",
             UnloadReason::MemoryCritical => "memory_critical",
+            UnloadReason::Evicted => "evicted",
             UnloadReason::Admin => "admin",
             UnloadReason::Crashed => "crashed",
             UnloadReason::Shutdown => "shutdown",
@@ -99,6 +116,7 @@ struct Inner {
     failed: u64,
     refused_memory: u64,
     refused_queue: u64,
+    cancelled: u64,
     loads: u64,
     load_failures: u64,
     last_load_ms: Option<f64>,
@@ -115,13 +133,15 @@ pub struct Stats {
     inner: Mutex<Inner>,
 }
 
-/// Everything `/stats` reports about counters (the child's live memory comes from the supervisor).
+/// Everything `/stats` reports about counters (the children's live memory comes from the pool).
 #[derive(Debug, Clone, Serialize)]
 pub struct Counters {
     pub requests_served: u64,
     pub requests_failed: u64,
     pub refused_insufficient_memory: u64,
     pub refused_queue_full: u64,
+    /// Requests ended by `DELETE /v1/requests/{id}`.
+    pub cancelled: u64,
     pub loads: u64,
     pub load_failures: u64,
     pub last_load_ms: Option<f64>,
@@ -158,6 +178,9 @@ impl Stats {
     pub fn refused_queue(&self) {
         self.with(|i| i.refused_queue += 1);
     }
+    pub fn cancelled(&self) {
+        self.with(|i| i.cancelled += 1);
+    }
     pub fn loaded(&self, ms: f64) {
         self.with(|i| {
             i.loads += 1;
@@ -193,6 +216,7 @@ impl Stats {
             requests_failed: i.failed,
             refused_insufficient_memory: i.refused_memory,
             refused_queue_full: i.refused_queue,
+            cancelled: i.cancelled,
             loads: i.loads,
             load_failures: i.load_failures,
             last_load_ms: i.last_load_ms,

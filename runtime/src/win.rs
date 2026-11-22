@@ -129,13 +129,6 @@ impl FILETIME {
     }
 }
 
-#[repr(C)]
-#[derive(Default, Clone, Copy)]
-struct LASTINPUTINFO {
-    cbSize: u32,
-    dwTime: u32,
-}
-
 /// SYSTEM_LOGICAL_PROCESSOR_INFORMATION; the 16-byte union is kept opaque.
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
@@ -160,13 +153,8 @@ extern "system" {
     fn QueryMemoryResourceNotification(h: HANDLE, state: *mut BOOL) -> BOOL;
     fn GetLogicalProcessorInformation(buf: *mut SYSTEM_LOGICAL_PROCESSOR_INFORMATION, len: *mut u32) -> BOOL;
     fn GetSystemTimes(idle: *mut FILETIME, kernel: *mut FILETIME, user: *mut FILETIME) -> BOOL;
-    fn GetTickCount() -> u32;
     fn SetPriorityClass(process: HANDLE, class: u32) -> BOOL;
-}
-
-#[link(name = "user32")]
-extern "system" {
-    fn GetLastInputInfo(info: *mut LASTINPUTINFO) -> BOOL;
+    fn WaitForSingleObject(h: HANDLE, ms: u32) -> u32;
 }
 
 #[link(name = "ntdll")]
@@ -391,15 +379,6 @@ pub fn system_times() -> Option<SystemTimes> {
     ok.then(|| SystemTimes { idle: i.get(), total: k.get() + u.get() })
 }
 
-/// Milliseconds since the last keyboard or mouse input in this session.
-pub fn input_idle_ms() -> Option<u64> {
-    let mut li = LASTINPUTINFO { cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
-    // SAFETY: valid in/out struct with its size.
-    let ok = unsafe { GetLastInputInfo(&mut li) } != 0;
-    // SAFETY: plain call. Both are 32-bit tick counts, so the difference wraps correctly.
-    ok.then(|| unsafe { GetTickCount() }.wrapping_sub(li.dwTime) as u64)
-}
-
 /// Set the priority class of a process by PID.
 pub fn set_priority_class(pid: u32, class: u32) -> bool {
     // SAFETY: plain Win32 calls; the handle is closed before returning.
@@ -411,6 +390,48 @@ pub fn set_priority_class(pid: u32, class: u32) -> bool {
         let ok = SetPriorityClass(h, class) != 0;
         CloseHandle(h);
         ok
+    }
+}
+
+const SYNCHRONIZE: u32 = 0x0010_0000;
+const INFINITE: u32 = 0xFFFF_FFFF;
+
+/// A handle to another process (the runtime's parent) that can be waited on. Holding the
+/// handle means a reused PID cannot be mistaken for the parent.
+pub struct ProcessWaiter(HANDLE);
+
+// SAFETY: kernel handle, usable from any thread.
+unsafe impl Send for ProcessWaiter {}
+unsafe impl Sync for ProcessWaiter {}
+
+impl ProcessWaiter {
+    pub fn open(pid: u32) -> io::Result<ProcessWaiter> {
+        // SAFETY: plain Win32 call; null means failure.
+        let h = unsafe { OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if h.is_null() {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(ProcessWaiter(h))
+        }
+    }
+
+    /// Block this thread until the process has exited.
+    pub fn wait(&self) {
+        // SAFETY: live handle opened with SYNCHRONIZE.
+        unsafe { WaitForSingleObject(self.0, INFINITE) };
+    }
+
+    /// True if the process has exited (does not block).
+    pub fn exited(&self) -> bool {
+        // SAFETY: live handle; a 0 ms wait only polls. WAIT_OBJECT_0 = 0.
+        unsafe { WaitForSingleObject(self.0, 0) == 0 }
+    }
+}
+
+impl Drop for ProcessWaiter {
+    fn drop(&mut self) {
+        // SAFETY: we own the handle.
+        unsafe { CloseHandle(self.0) };
     }
 }
 
@@ -446,7 +467,6 @@ mod tests {
         assert_eq!(std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>(), 80);
         assert_eq!(std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>(), 48);
         assert_eq!(std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>(), 8);
-        assert_eq!(std::mem::size_of::<LASTINPUTINFO>(), 8);
     }
 
     #[test]
@@ -458,7 +478,18 @@ mod tests {
         assert!(cores >= 1 && cores <= logical);
         let t = system_times().unwrap();
         assert!(t.total >= t.idle && t.total > 0);
-        assert!(input_idle_ms().is_some());
+    }
+
+    #[test]
+    fn a_process_can_be_waited_on() {
+        let me = ProcessWaiter::open(std::process::id()).unwrap();
+        assert!(!me.exited());
+        let mut child = std::process::Command::new("cmd").args(["/C", "exit 0"]).spawn().unwrap();
+        let w = ProcessWaiter::open(child.id()).unwrap();
+        w.wait();
+        assert!(w.exited());
+        child.wait().unwrap();
+        assert!(ProcessWaiter::open(0xFFFF_FFF0).is_err());
     }
 
     #[test]

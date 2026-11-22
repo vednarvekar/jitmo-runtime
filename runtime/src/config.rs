@@ -1,5 +1,9 @@
-//! The one TOML config file: API server, model + llama-server child, RAM budget, chains.
-//! Every field has a default; relative paths are resolved against the config file's folder.
+//! The one TOML config file: API server, models (each a llama-server child), RAM budget,
+//! pacer, chains. Every field has a default; relative paths are resolved against the config
+//! file's folder.
+//!
+//! Models: either the v0 form, one `[model]` table, or several `[[models]]` entries. After
+//! loading, `Config::models` always holds the list (the `[model]` table becomes its only entry).
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -13,7 +17,9 @@ pub const DEFAULT_CONFIG_FILE: &str = "jitmo-runtime.toml";
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub server: ServerConfig,
-    pub model: ModelConfig,
+    /// v0 form: one model. Moved into `models` by `normalize`.
+    pub model: Option<ModelConfig>,
+    pub models: Vec<ModelConfig>,
     pub budget: BudgetConfig,
     pub pacer: PacerConfig,
     pub chains: Vec<ChainConfig>,
@@ -24,25 +30,51 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
     pub host: String,
+    /// 0 = pick a free port (printed as `JITMO_RUNTIME_LISTENING port=<n>`).
     pub port: u16,
-    /// Requests allowed to wait while one generation runs. More are refused with 503.
+    /// Requests allowed to wait for a generation slot. More are refused with 503.
     pub max_queue: usize,
+    /// Generations that may run at the same time across all models. The models share the
+    /// memory bandwidth, so 1 is the default.
+    pub max_concurrent: usize,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
-        ServerConfig { host: "127.0.0.1".into(), port: 8090, max_queue: 8 }
+        ServerConfig { host: "127.0.0.1".into(), port: 8090, max_queue: 8, max_concurrent: 1 }
     }
 }
 
-/// The base model and how the llama-server child is started.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelKind {
+    #[default]
+    Chat,
+    Embedding,
+}
+
+impl ModelKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModelKind::Chat => "chat",
+            ModelKind::Embedding => "embedding",
+        }
+    }
+}
+
+/// One model and how its llama-server child is started.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ModelConfig {
     /// Model id clients send in `"model"`.
     pub name: String,
+    /// `chat` (default) or `embedding` (llama-server runs with `--embeddings`).
+    pub kind: ModelKind,
     pub path: PathBuf,
     pub llama_server: PathBuf,
+    /// Never evicted to make room for another model, and never unloaded for idleness.
+    /// Memory pressure still unloads it.
+    pub pinned: bool,
     /// Private port of the child. 0 = pick a free port at each start.
     pub port: u16,
     pub ctx_size: u32,
@@ -66,22 +98,35 @@ pub struct ModelConfig {
     /// holds a copy of the SWA/recurrent state, so the automatic memory cap includes them.
     /// llama-server's own default is 32.
     pub ctx_checkpoints: u32,
+    /// Embedding models only: `none`, `mean`, `cls`, `last` or `rank`. None = the model's default.
+    pub pooling: Option<String>,
+    /// LoRA adapters loaded with this model (scale 0) for requests to pick by id
+    /// (`"lora": [{"id": 0, "scale": 1.0}]`). Adapters used by chain steps on this model are
+    /// added after these.
+    pub adapters: Vec<PathBuf>,
     /// Sent as `chat_template_kwargs` on every request that does not set its own.
     pub chat_template_kwargs: Option<Value>,
     /// Extra llama-server arguments, appended as-is.
     pub extra_args: Vec<String>,
     /// File for llama-server's own log (truncated at each start). Empty = discard.
-    pub log_file: PathBuf,
+    /// Unset = `llama-server.log` with one model, `llama-server-<name>.log` with several.
+    pub log_file: Option<PathBuf>,
     /// Give up if the model is not ready after this long.
     pub load_timeout_secs: u64,
+    /// Per-model overrides of the `[budget]` values of the same name.
+    pub memory_cap_mb: Option<MemoryCap>,
+    pub load_estimate_mb: Option<u64>,
+    pub idle_unload_secs: Option<u64>,
 }
 
 impl Default for ModelConfig {
     fn default() -> Self {
         ModelConfig {
             name: "jitmo-base".into(),
+            kind: ModelKind::Chat,
             path: r"V:\jitmo-sandbox\models\Qwen3-4B-Instruct-2507-Q4_K_M.gguf".into(),
             llama_server: r"V:\jitmo-sandbox\llama\llama-server.exe".into(),
+            pinned: false,
             port: 0,
             ctx_size: 4096,
             threads: 0,
@@ -92,11 +137,30 @@ impl Default for ModelConfig {
             low_priority: true,
             cache_ram_mb: 256,
             ctx_checkpoints: 4,
+            pooling: None,
+            adapters: Vec::new(),
             chat_template_kwargs: None,
             extra_args: Vec::new(),
-            log_file: "llama-server.log".into(),
+            log_file: None,
             load_timeout_secs: 180,
+            memory_cap_mb: None,
+            load_estimate_mb: None,
+            idle_unload_secs: None,
         }
+    }
+}
+
+impl ModelConfig {
+    /// Physical batch size. Embedding models read the whole input in one batch, so it is the ctx.
+    pub fn ubatch(&self) -> u32 {
+        match self.kind {
+            ModelKind::Embedding => self.ctx_size,
+            ModelKind::Chat => 512,
+        }
+    }
+
+    pub fn log_path(&self) -> PathBuf {
+        self.log_file.clone().unwrap_or_default()
     }
 }
 
@@ -127,24 +191,27 @@ impl<'de> Deserialize<'de> for MemoryCap {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BudgetConfig {
-    /// Job Object per-process commit (private bytes) limit for the child.
+    /// Job Object per-process commit (private bytes) limit for each child.
     /// `auto` = KV cache + recurrent state + compute buffers + prompt cache + checkpoints + a fixed
     /// overhead, from the GGUF metadata (see `budget::MemoryEstimate`). 0 = no cap.
     /// It does not count mmap'd weight pages.
     pub memory_cap_mb: MemoryCap,
-    /// Refuse to start the model if free RAM after the load would be below this.
+    /// Refuse to start a model if free RAM after the load would be below this.
     pub reserve_free_mb: u64,
-    /// RAM the model is expected to take when loaded. 0 = model file size + the memory cap
-    /// (or + 1024 MB when there is no cap).
+    /// RAM a model is expected to take when loaded. 0 = estimate it (private estimate + the
+    /// part of the mapped file that will be resident; see `budget::LoadEstimate`).
     pub load_estimate_mb: u64,
+    /// Total load estimate of all loaded models may not exceed this. 0 = no pool limit (only
+    /// the free-RAM check). Least recently used idle, unpinned models are evicted to make room.
+    pub pool_budget_mb: u64,
     /// Memory pressure: free RAM below this on two checks in a row (or Windows signals low
-    /// memory). A running generation may finish first; then the model is unloaded.
+    /// memory). Running generations may finish first; then their models are unloaded.
     pub pressure_free_mb: u64,
-    /// Free RAM below this on one check: unload at once, even mid-generation. 0 = never.
+    /// Free RAM below this on one check: unload every model at once, even mid-generation. 0 = never.
     pub critical_free_mb: u64,
-    /// Unload after this many seconds without requests. 0 = never.
+    /// Unload a model after this many seconds without requests. 0 = never.
     pub idle_unload_secs: u64,
-    /// How often the watchdog checks idle time, memory pressure and the child.
+    /// How often the watchdog checks idle time, memory pressure and the children.
     pub watch_interval_ms: u64,
 }
 
@@ -154,6 +221,7 @@ impl Default for BudgetConfig {
             memory_cap_mb: MemoryCap::Auto,
             reserve_free_mb: 1536,
             load_estimate_mb: 0,
+            pool_budget_mb: 0,
             pressure_free_mb: 1024,
             critical_free_mb: 500,
             idle_unload_secs: 90,
@@ -162,27 +230,35 @@ impl Default for BudgetConfig {
     }
 }
 
-/// "Don't freeze the PC": cap the child's CPU while the user is busy.
+/// "Don't freeze the PC": cap the children's CPU, at a level that fits how busy the PC is.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PacerConfig {
-    /// `auto` (cap while busy), `always` (cap all the time) or `off`.
+    /// `auto` (level from the signals), `always` (always the heavy level) or `off`.
     pub mode: String,
-    /// How often the pacer samples input, CPU and RAM.
+    /// How often the pacer samples CPU and RAM.
     pub poll_ms: u64,
-    /// The user counts as active if there was keyboard or mouse input this recently. 0 = ignore input.
-    pub input_active_ms: u64,
-    /// Busy if other processes use more than this share of all logical processors. 0 = ignore CPU.
-    pub others_cpu_busy_pct: f64,
-    /// Busy if free RAM is below this. 0 = ignore RAM.
+    /// Other processes' CPU is averaged over this long, so one short spike does not count.
+    pub smooth_ms: u64,
+    /// Other processes above this share of all logical processors = light level. 0 = never.
+    pub light_cpu_pct: f64,
+    /// Above this = heavy level. 0 = never.
+    pub heavy_cpu_pct: f64,
+    /// Free RAM below this = heavy level. 0 = use `budget.pressure_free_mb`.
     pub low_free_mb: u64,
-    /// While busy, the child may use this share of the CPU it uses at full speed
-    /// (its threads / logical processors), as a Job Object hard cap. 100 = no CPU cap.
-    pub busy_cpu_pct: u32,
-    /// While busy, also set the child to this priority class: `unchanged` or `idle`.
-    pub busy_priority: String,
-    /// Keep the cap this long after the last busy sample.
+    /// Caps, as a share of the CPU a child uses at full speed (its threads / logical processors).
+    pub light_cap_pct: u32,
+    pub heavy_cap_pct: u32,
+    /// To go down a level, other processes' CPU must be this many points below the threshold.
+    pub hysteresis_pct: f64,
+    /// A level holds at least this long before it may go down.
     pub release_after_ms: u64,
+    /// While capped, also set the children to this priority class: `unchanged` or `idle`.
+    pub busy_priority: String,
+    /// Pacer v1 keys, accepted and ignored (a warning is logged).
+    pub input_active_ms: Option<u64>,
+    pub others_cpu_busy_pct: Option<f64>,
+    pub busy_cpu_pct: Option<u32>,
 }
 
 impl Default for PacerConfig {
@@ -190,12 +266,18 @@ impl Default for PacerConfig {
         PacerConfig {
             mode: "auto".into(),
             poll_ms: 300,
-            input_active_ms: 5000,
-            others_cpu_busy_pct: 10.0,
-            low_free_mb: 2048,
-            busy_cpu_pct: 50,
+            smooth_ms: 1500,
+            light_cpu_pct: 15.0,
+            heavy_cpu_pct: 40.0,
+            low_free_mb: 0,
+            light_cap_pct: 75,
+            heavy_cap_pct: 50,
+            hysteresis_pct: 5.0,
+            release_after_ms: 5000,
             busy_priority: "unchanged".into(),
-            release_after_ms: 2000,
+            input_active_ms: None,
+            others_cpu_busy_pct: None,
+            busy_cpu_pct: None,
         }
     }
 }
@@ -213,6 +295,8 @@ pub struct ChainConfig {
 #[serde(deny_unknown_fields)]
 pub struct StepConfig {
     pub name: String,
+    /// Model for this step (a chat model's name). Default: the first chat model.
+    pub model: Option<String>,
     /// System prompt template.
     #[serde(default)]
     pub system: String,
@@ -248,7 +332,9 @@ fn default_lora_scale() -> f64 {
 }
 
 const KV_TYPES: &[&str] = &["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"];
-const RESERVED_NAMES: &[&str] = &["input", "prev"];
+const POOLING: &[&str] = &["none", "mean", "cls", "last", "rank"];
+/// Step names that templates use for other things.
+pub const RESERVED_NAMES: &[&str] = &["input", "prev"];
 
 impl Config {
     /// Parse TOML text and check it. Paths are left as written.
@@ -270,7 +356,7 @@ impl Config {
 
     /// Built-in defaults, with relative paths resolved against `base`.
     pub fn defaults(base: &Path) -> Config {
-        let mut cfg = Config::default();
+        let mut cfg = Config::from_toml("").expect("the defaults are valid");
         cfg.resolve_paths(base);
         cfg
     }
@@ -281,9 +367,16 @@ impl Config {
                 *p = base.join(&*p);
             }
         };
-        fix(&mut self.model.path);
-        fix(&mut self.model.llama_server);
-        fix(&mut self.model.log_file);
+        for m in &mut self.models {
+            fix(&mut m.path);
+            fix(&mut m.llama_server);
+            if let Some(l) = m.log_file.as_mut() {
+                fix(l);
+            }
+            for a in &mut m.adapters {
+                fix(a);
+            }
+        }
         for chain in &mut self.chains {
             for step in &mut chain.steps {
                 if let Some(l) = step.lora.as_mut() {
@@ -293,8 +386,22 @@ impl Config {
         }
     }
 
-    /// A JSON schema given as a string is parsed into JSON here.
+    /// `[model]` becomes the only `[[models]]` entry (none at all = the default model); log
+    /// files get their default names; a JSON schema given as a string is parsed into JSON.
     fn normalize(&mut self) -> Result<()> {
+        match (self.model.take(), self.models.is_empty()) {
+            (Some(_), false) => bail!("use either [model] (one model) or [[models]] (several), not both"),
+            (Some(m), true) => self.models.push(m),
+            (None, true) => self.models.push(ModelConfig::default()),
+            (None, false) => {}
+        }
+        let several = self.models.len() > 1;
+        for m in &mut self.models {
+            if m.log_file.is_none() {
+                m.log_file =
+                    Some(if several { format!("llama-server-{}.log", m.name).into() } else { "llama-server.log".into() });
+            }
+        }
         for chain in &mut self.chains {
             for step in &mut chain.steps {
                 if let Some(Value::String(s)) = &step.json_schema {
@@ -308,17 +415,38 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.model.name.is_empty() || self.model.name.starts_with("chain:") {
-            bail!("model.name must be set and must not start with 'chain:'");
+        let mut names = HashSet::new();
+        for m in &self.models {
+            let at = || format!("model '{}'", m.name);
+            if m.name.is_empty() || m.name.starts_with("chain:") {
+                bail!("{}: name must be set and must not start with 'chain:'", at());
+            }
+            if !names.insert(m.name.as_str()) {
+                bail!("{}: model name used twice", at());
+            }
+            if !KV_TYPES.contains(&m.kv_cache_type.as_str()) {
+                bail!("{}: kv_cache_type '{}' is not one of {:?}", at(), m.kv_cache_type, KV_TYPES);
+            }
+            if !["on", "off", "auto"].contains(&m.flash_attn.as_str()) {
+                bail!("{}: flash_attn must be on, off or auto", at());
+            }
+            if m.ctx_size < 256 {
+                bail!("{}: ctx_size must be at least 256", at());
+            }
+            if let Some(p) = &m.pooling {
+                if m.kind != ModelKind::Embedding {
+                    bail!("{}: pooling is only for kind = \"embedding\"", at());
+                }
+                if !POOLING.contains(&p.as_str()) {
+                    bail!("{}: pooling must be one of {:?}", at(), POOLING);
+                }
+            }
+            if m.kind == ModelKind::Embedding && !m.adapters.is_empty() {
+                bail!("{}: LoRA adapters are for chat models", at());
+            }
         }
-        if !KV_TYPES.contains(&self.model.kv_cache_type.as_str()) {
-            bail!("model.kv_cache_type '{}' is not one of {:?}", self.model.kv_cache_type, KV_TYPES);
-        }
-        if !["on", "off", "auto"].contains(&self.model.flash_attn.as_str()) {
-            bail!("model.flash_attn must be on, off or auto");
-        }
-        if self.model.ctx_size < 256 {
-            bail!("model.ctx_size must be at least 256");
+        if self.server.max_concurrent == 0 {
+            bail!("server.max_concurrent must be at least 1");
         }
         if self.budget.watch_interval_ms < 100 {
             bail!("budget.watch_interval_ms must be at least 100");
@@ -333,11 +461,23 @@ impl Config {
         if !["unchanged", "idle"].contains(&p.busy_priority.as_str()) {
             bail!("pacer.busy_priority must be unchanged or idle");
         }
-        if !(1..=100).contains(&p.busy_cpu_pct) {
-            bail!("pacer.busy_cpu_pct must be between 1 and 100");
+        if !(1..=100).contains(&p.light_cap_pct) || !(1..=100).contains(&p.heavy_cap_pct) {
+            bail!("pacer.light_cap_pct and pacer.heavy_cap_pct must be between 1 and 100");
+        }
+        if p.heavy_cap_pct > p.light_cap_pct {
+            bail!("pacer.heavy_cap_pct must not be above pacer.light_cap_pct (heavy caps harder)");
+        }
+        if p.heavy_cpu_pct > 0.0 && p.light_cpu_pct > p.heavy_cpu_pct {
+            bail!("pacer.light_cpu_pct must not be above pacer.heavy_cpu_pct");
+        }
+        if p.hysteresis_pct < 0.0 {
+            bail!("pacer.hysteresis_pct must not be negative");
         }
         if p.poll_ms < 50 {
             bail!("pacer.poll_ms must be at least 50");
+        }
+        if p.smooth_ms < p.poll_ms {
+            bail!("pacer.smooth_ms must be at least pacer.poll_ms");
         }
         let mut chain_names = HashSet::new();
         for chain in &self.chains {
@@ -348,14 +488,15 @@ impl Config {
             if chain.steps.is_empty() {
                 bail!("chain '{}' has no steps", chain.name);
             }
-            let mut known: Vec<&str> = vec!["input"];
+            let all_steps: Vec<&str> = chain.steps.iter().map(|s| s.name.as_str()).collect();
+            let mut earlier: Vec<&str> = Vec::new();
             for (i, step) in chain.steps.iter().enumerate() {
                 let at = || format!("chain '{}' step '{}'", chain.name, step.name);
                 check_name(&step.name).with_context(at)?;
                 if RESERVED_NAMES.contains(&step.name.as_str()) {
                     bail!("{}: 'input' and 'prev' are reserved step names", at());
                 }
-                if known.contains(&step.name.as_str()) {
+                if earlier.contains(&step.name.as_str()) {
                     bail!("{}: step name used twice", at());
                 }
                 if step.json_schema.is_some() && step.grammar.is_some() {
@@ -366,27 +507,19 @@ impl Config {
                         bail!("{}: json_schema must be a table/object", at());
                     }
                 }
-                if i > 0 {
-                    known.push("prev");
+                if let Some(name) = &step.model {
+                    match self.models.iter().find(|m| &m.name == name) {
+                        None => bail!("{}: no model named '{name}'", at()),
+                        Some(m) if m.kind != ModelKind::Chat => bail!("{}: model '{name}' is not a chat model", at()),
+                        _ => {}
+                    }
+                } else if self.default_chat().is_none() {
+                    bail!("{}: there is no chat model", at());
                 }
                 for (field, text) in [("system", step.system.as_str()), ("input", step.input_template(i))] {
-                    let t = crate::chain::Template::parse(text);
-                    for var in t.var_names() {
-                        if !known.contains(&var) {
-                            bail!(
-                                "{}: {} uses {{{}}}, but only {} are available here",
-                                at(),
-                                field,
-                                var,
-                                known.iter().map(|k| format!("{{{k}}}")).collect::<Vec<_>>().join(", ")
-                            );
-                        }
-                    }
+                    check_template(text, i, &earlier, &all_steps).with_context(|| format!("{}: {field}", at()))?;
                 }
-                if i > 0 {
-                    known.pop(); // "prev"
-                }
-                known.push(&step.name);
+                earlier.push(&step.name);
             }
         }
         Ok(())
@@ -394,27 +527,45 @@ impl Config {
 
     /// Check that the files the runtime needs exist (done at startup, not in unit tests).
     pub fn check_files(&self) -> Result<()> {
-        if !self.model.path.is_file() {
-            bail!("model file not found: {}", self.model.path.display());
-        }
-        if !self.model.llama_server.is_file() {
-            bail!("llama-server not found: {}", self.model.llama_server.display());
-        }
-        for path in self.adapters() {
-            if !path.is_file() {
-                bail!("LoRA adapter not found: {}", path.display());
+        for m in &self.models {
+            if !m.path.is_file() {
+                bail!("model '{}': file not found: {}", m.name, m.path.display());
+            }
+            if !m.llama_server.is_file() {
+                bail!("model '{}': llama-server not found: {}", m.name, m.llama_server.display());
+            }
+            for path in self.adapters_for(&m.name) {
+                if !path.is_file() {
+                    bail!("model '{}': LoRA adapter not found: {}", m.name, path.display());
+                }
             }
         }
         Ok(())
     }
 
-    /// Unique LoRA adapter files used by any chain step, in first-use order. The index in
-    /// this list is the adapter id llama-server uses.
-    pub fn adapters(&self) -> Vec<PathBuf> {
+    /// The first chat model: what a request without `model` (and a chain step without one) uses.
+    pub fn default_chat(&self) -> Option<&ModelConfig> {
+        self.models.iter().find(|m| m.kind == ModelKind::Chat)
+    }
+
+    /// The model name a chain step runs on.
+    pub fn step_model<'a>(&'a self, step: &'a StepConfig) -> &'a str {
+        step.model.as_deref().or(self.default_chat().map(|m| m.name.as_str())).unwrap_or("")
+    }
+
+    /// LoRA adapter files of one model: its own `adapters`, then those of chain steps that run on
+    /// it, without repeats. The index in this list is the adapter id llama-server uses.
+    pub fn adapters_for(&self, model: &str) -> Vec<PathBuf> {
         let mut out: Vec<PathBuf> = Vec::new();
+        let Some(m) = self.models.iter().find(|m| m.name == model) else { return out };
+        for a in &m.adapters {
+            if !out.contains(a) {
+                out.push(a.clone());
+            }
+        }
         for step in self.chains.iter().flat_map(|c| &c.steps) {
             if let Some(l) = &step.lora {
-                if !out.contains(&l.path) {
+                if self.step_model(step) == model && !out.contains(&l.path) {
                     out.push(l.path.clone());
                 }
             }
@@ -426,6 +577,21 @@ impl Config {
     pub fn chain(&self, name: &str) -> Option<&ChainConfig> {
         self.chains.iter().find(|c| c.name == name)
     }
+}
+
+/// A template may use `{input}`, `{prev}` (not in the first step), earlier steps' outputs and
+/// request variables (any other name). Naming this step or a later one is an error.
+pub fn check_template(text: &str, index: usize, earlier: &[&str], all_steps: &[&str]) -> Result<()> {
+    let t = crate::chain::Template::parse(text);
+    for var in t.var_names() {
+        if var == "prev" && index == 0 {
+            bail!("uses {{prev}}, but the first step has no previous step");
+        }
+        if all_steps.contains(&var) && !earlier.contains(&var) {
+            bail!("uses {{{var}}}, but step '{var}' has not run yet here (only earlier steps can be used)");
+        }
+    }
+    Ok(())
 }
 
 impl StepConfig {
@@ -457,18 +623,27 @@ mod tests {
         let cfg = Config::from_toml("").unwrap();
         assert_eq!(cfg.server.port, 8090);
         assert_eq!(cfg.server.host, "127.0.0.1");
-        assert_eq!(cfg.model.name, "jitmo-base");
-        assert_eq!(cfg.model.ctx_size, 4096);
-        assert_eq!(cfg.model.kv_cache_type, "f16");
-        assert!(cfg.model.no_repack && cfg.model.mmap);
+        assert_eq!((cfg.server.max_queue, cfg.server.max_concurrent), (8, 1));
+        assert_eq!(cfg.models.len(), 1);
+        let m = &cfg.models[0];
+        assert_eq!(m.name, "jitmo-base");
+        assert_eq!(m.kind, ModelKind::Chat);
+        assert_eq!(m.ctx_size, 4096);
+        assert_eq!(m.kv_cache_type, "f16");
+        assert!(m.no_repack && m.mmap && !m.pinned);
+        assert_eq!(m.log_file, Some(PathBuf::from("llama-server.log")));
         assert_eq!(cfg.budget.memory_cap_mb, MemoryCap::Auto);
-        assert_eq!(cfg.budget.reserve_free_mb, 1536);
+        assert_eq!((cfg.budget.reserve_free_mb, cfg.budget.pool_budget_mb), (1536, 0));
         assert_eq!((cfg.budget.pressure_free_mb, cfg.budget.critical_free_mb), (1024, 500));
-        assert_eq!((cfg.model.cache_ram_mb, cfg.model.ctx_checkpoints), (256, 4));
+        assert_eq!((m.cache_ram_mb, m.ctx_checkpoints), (256, 4));
         assert_eq!(cfg.pacer.mode, "auto");
-        assert_eq!(cfg.pacer.busy_cpu_pct, 50);
+        assert_eq!((cfg.pacer.light_cpu_pct, cfg.pacer.heavy_cpu_pct), (15.0, 40.0));
+        assert_eq!((cfg.pacer.light_cap_pct, cfg.pacer.heavy_cap_pct, cfg.pacer.smooth_ms), (75, 50, 1500));
+        // v1 keys still parse (ignored with a warning).
+        assert!(Config::from_toml("[pacer]\ninput_active_ms = 5000\nbusy_cpu_pct = 50\nothers_cpu_busy_pct = 10.0").is_ok());
         assert_eq!(cfg.budget.idle_unload_secs, 90);
         assert!(cfg.chains.is_empty());
+        assert!(cfg.model.is_none(), "moved into models");
     }
 
     #[test]
@@ -476,7 +651,7 @@ mod tests {
         let text = include_str!("../jitmo-runtime.toml");
         let cfg = Config::from_toml(text).unwrap();
         assert!(cfg.chain("classify-answer").is_some());
-        assert!(cfg.adapters().is_empty(), "the example must work without adapters");
+        assert!(cfg.adapters_for(&cfg.models[0].name).is_empty(), "the example must work without adapters");
     }
 
     #[test]
@@ -514,8 +689,8 @@ mod tests {
         assert_eq!(Config::from_toml("[budget]\nmemory_cap_mb = \"auto\"").unwrap().budget.memory_cap_mb, MemoryCap::Auto);
         assert_eq!(cfg.server.port, 9000);
         assert_eq!(cfg.server.max_queue, 8, "unset fields keep defaults");
-        assert_eq!(cfg.model.threads, 2);
-        assert_eq!(cfg.model.chat_template_kwargs.as_ref().unwrap()["enable_thinking"], Value::Bool(false));
+        assert_eq!(cfg.models[0].threads, 2);
+        assert_eq!(cfg.models[0].chat_template_kwargs.as_ref().unwrap()["enable_thinking"], Value::Bool(false));
         let chain = cfg.chain("plan-write").unwrap();
         assert_eq!(chain.steps[0].input_template(0), "{input}");
         assert_eq!(chain.steps[0].temperature, 0.2);
@@ -523,8 +698,59 @@ mod tests {
         assert_eq!(chain.steps[1].lora.as_ref().unwrap().scale, 0.5);
 
         cfg.resolve_paths(Path::new(r"C:\cfg"));
-        assert_eq!(cfg.model.path, PathBuf::from(r"C:\cfg\models/m.gguf"));
-        assert_eq!(cfg.adapters(), vec![PathBuf::from(r"C:\cfg\adapters/writer.gguf")]);
+        assert_eq!(cfg.models[0].path, PathBuf::from(r"C:\cfg\models/m.gguf"));
+        assert_eq!(cfg.models[0].log_file, Some(PathBuf::from(r"C:\cfg\llama-server.log")));
+        assert_eq!(cfg.adapters_for("base"), vec![PathBuf::from(r"C:\cfg\adapters/writer.gguf")]);
+    }
+
+    #[test]
+    fn several_models_with_kinds_steps_and_adapters() {
+        let text = r#"
+            [budget]
+            pool_budget_mb = 3000
+            [server]
+            max_concurrent = 2
+            [[models]]
+            name = "router"
+            path = "r.gguf"
+            ctx_size = 2048
+            pinned = true
+            adapters = ["a0.gguf"]
+            [[models]]
+            name = "writer"
+            path = "w.gguf"
+            memory_cap_mb = 900
+            idle_unload_secs = 30
+            [[models]]
+            name = "embed"
+            kind = "embedding"
+            path = "e.gguf"
+            ctx_size = 512
+            pooling = "mean"
+            [[chains]]
+            name = "c"
+            [[chains.steps]]
+            name = "pick"
+            lora = { path = "a1.gguf" }
+            [[chains.steps]]
+            name = "write"
+            model = "writer"
+            lora = { path = "a2.gguf" }
+        "#;
+        let cfg = Config::from_toml(text).unwrap();
+        assert_eq!(cfg.models.len(), 3);
+        assert_eq!((cfg.budget.pool_budget_mb, cfg.server.max_concurrent), (3000, 2));
+        assert_eq!(cfg.models[2].kind, ModelKind::Embedding);
+        assert_eq!(cfg.models[2].ubatch(), 512);
+        assert_eq!(cfg.models[0].ubatch(), 512);
+        assert_eq!(cfg.models[1].memory_cap_mb, Some(MemoryCap::Mb(900)));
+        assert_eq!(cfg.models[1].log_file, Some(PathBuf::from("llama-server-writer.log")));
+        assert_eq!(cfg.default_chat().unwrap().name, "router");
+        let c = cfg.chain("c").unwrap();
+        assert_eq!(cfg.step_model(&c.steps[0]), "router");
+        assert_eq!(cfg.adapters_for("router"), vec![PathBuf::from("a0.gguf"), PathBuf::from("a1.gguf")]);
+        assert_eq!(cfg.adapters_for("writer"), vec![PathBuf::from("a2.gguf")]);
+        assert!(cfg.adapters_for("embed").is_empty());
     }
 
     #[test]
@@ -550,17 +776,32 @@ mod tests {
         let cases = [
             ("[model]\nkv_cache_type = \"q3\"", "kv_cache_type"),
             ("[model]\nnmae = \"x\"", "unknown field"),
+            ("[model]\nname = \"a\"\n[[models]]\nname = \"b\"", "not both"),
+            ("[[models]]\nname = \"a\"\n[[models]]\nname = \"a\"", "used twice"),
+            ("[[models]]\nname = \"a\"\nkind = \"encoder\"", "unknown variant"),
+            ("[[models]]\nname = \"a\"\npooling = \"mean\"", "only for kind"),
+            ("[[models]]\nname = \"a\"\nkind = \"embedding\"\npooling = \"avg\"", "pooling must be"),
+            ("[server]\nmax_concurrent = 0", "max_concurrent"),
             ("[budget]\nmemory_cap_mb = \"big\"", "auto"),
             ("[budget]\ncritical_free_mb = 2000", "critical_free_mb"),
             ("[pacer]\nmode = \"sometimes\"", "pacer.mode"),
-            ("[pacer]\nbusy_cpu_pct = 0", "busy_cpu_pct"),
+            ("[pacer]\nheavy_cap_pct = 0", "heavy_cap_pct"),
+            ("[pacer]\nheavy_cap_pct = 90", "heavy caps harder"),
+            ("[pacer]\nlight_cpu_pct = 50.0", "light_cpu_pct"),
+            ("[pacer]\nsmooth_ms = 100", "smooth_ms"),
             ("[pacer]\nbusy_priority = \"high\"", "busy_priority"),
             ("[[chains]]\nname = \"c\"\nsteps = []", "no steps"),
             ("[[chains]]\nname = \"c\"\n[[chains.steps]]\nname = \"a\"\ninput = \"{prev}\"", "{prev}"),
             ("[[chains]]\nname = \"c\"\n[[chains.steps]]\nname = \"a\"\nsystem = \"{later}\"\n[[chains.steps]]\nname = \"later\"", "{later}"),
+            ("[[chains]]\nname = \"c\"\n[[chains.steps]]\nname = \"a\"\nsystem = \"{a}\"", "{a}"),
             ("[[chains]]\nname = \"c\"\n[[chains.steps]]\nname = \"a\"\n[[chains.steps]]\nname = \"a\"", "twice"),
             ("[[chains]]\nname = \"c\"\n[[chains.steps]]\nname = \"input\"", "reserved"),
             ("[[chains]]\nname = \"bad name\"\n[[chains.steps]]\nname = \"a\"", "not a valid name"),
+            ("[[chains]]\nname = \"c\"\n[[chains.steps]]\nname = \"a\"\nmodel = \"nope\"", "no model named"),
+            (
+                "[[models]]\nname = \"e\"\nkind = \"embedding\"\n[[chains]]\nname = \"c\"\n[[chains.steps]]\nname = \"a\"\nmodel = \"e\"",
+                "not a chat model",
+            ),
             ("[[chains]]\nname = \"c\"\n[[chains.steps]]\nname = \"a\"\ngrammar = \"root ::= [0-9]\"\njson_schema = { type = \"object\" }", "not both"),
             ("[[chains]]\nname = \"c\"\n[[chains.steps]]\nname = \"a\"\njson_schema = '{nope'", "not valid JSON"),
         ];
@@ -571,15 +812,16 @@ mod tests {
     }
 
     #[test]
-    fn named_outputs_and_fields_of_earlier_steps_are_allowed() {
+    fn named_outputs_fields_and_request_vars_are_allowed() {
         let text = r#"
             [[chains]]
             name = "c"
             [[chains.steps]]
             name = "classify"
+            input = "Q: {question}"
             [[chains.steps]]
             name = "answer"
-            system = "Kind: {classify.kind}. Raw: {classify}. Previous: {prev}."
+            system = "Kind: {classify.kind}. Raw: {classify}. Previous: {prev}. Passage: {passage}"
             input = "{input}"
         "#;
         Config::from_toml(text).unwrap();

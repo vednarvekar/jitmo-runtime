@@ -39,6 +39,23 @@ impl Error {
         Error::new(502, "engine_error", m)
     }
 
+    /// The request was cancelled with `DELETE /v1/requests/{id}` (status 499, as nginx uses
+    /// for "client closed request").
+    pub fn cancelled(m: impl Into<String>) -> Error {
+        Error::new(499, "request_cancelled", m)
+    }
+    pub fn request_not_found(m: impl Into<String>) -> Error {
+        Error::new(404, "request_not_found", m)
+    }
+    /// A client-chosen request id that is already in use.
+    pub fn conflict(m: impl Into<String>) -> Error {
+        Error::new(409, "request_id_in_use", m)
+    }
+    /// The model exists but cannot do this (for example embeddings on a chat model).
+    pub fn wrong_kind(m: impl Into<String>) -> Error {
+        Error::new(400, "wrong_model_kind", m)
+    }
+
     pub fn with_prefix(mut self, prefix: &str) -> Error {
         self.message = format!("{prefix}: {}", self.message);
         self

@@ -1,9 +1,9 @@
-//! Just enough of a GGUF reader to size the model's private memory before it loads:
-//! the metadata key/values (the tensor list and the weights are never read).
+//! Just enough of a GGUF reader to size the model's memory before it loads: the metadata
+//! key/values and the tensor list (names and sizes; the weights themselves are never read).
 
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
-use std::io::{BufReader, Read, Seek};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 /// A metadata value. Big arrays (the tokenizer vocab) are kept only as a length.
@@ -23,6 +23,8 @@ const MAX_KEPT: u64 = 4096;
 
 pub struct Gguf {
     pub kv: HashMap<String, Meta>,
+    /// (tensor name, bytes in the file including alignment padding), in file order.
+    pub tensors: Vec<(String, u64)>,
 }
 
 impl Gguf {
@@ -41,7 +43,7 @@ impl Gguf {
         if !(2..=3).contains(&version) {
             bail!("GGUF version {version} is not supported");
         }
-        let _tensors = u64_(r)?;
+        let n_tensors = u64_(r)?;
         let n_kv = u64_(r)?;
         let mut kv = HashMap::new();
         for _ in 0..n_kv {
@@ -50,7 +52,45 @@ impl Gguf {
             let v = value(r, ty)?;
             kv.insert(key, v);
         }
-        Ok(Gguf { kv })
+        if n_tensors > 1 << 20 {
+            bail!("{n_tensors} tensors is implausible");
+        }
+        let mut infos: Vec<(String, u64)> = Vec::with_capacity(n_tensors as usize);
+        for _ in 0..n_tensors {
+            let name = string(r)?;
+            let n_dims = u32_(r)?;
+            if n_dims > 8 {
+                bail!("tensor {name} has {n_dims} dimensions");
+            }
+            for _ in 0..n_dims {
+                u64_(r)?;
+            }
+            let _ty = u32_(r)?;
+            let offset = u64_(r)?;
+            infos.push((name, offset));
+        }
+        let align = match kv.get("general.alignment") {
+            Some(Meta::Int(a)) if *a > 0 => *a as u64,
+            _ => 32,
+        };
+        let data_start = r.stream_position()?.div_ceil(align) * align;
+        let end = r.seek(SeekFrom::End(0))?;
+        let data_len = end.saturating_sub(data_start);
+        // Sizes from the offsets: each tensor runs to the next one (or to the end of the file).
+        let mut order: Vec<usize> = (0..infos.len()).collect();
+        order.sort_by_key(|&i| infos[i].1);
+        let mut sizes = vec![0u64; infos.len()];
+        for (k, &i) in order.iter().enumerate() {
+            let next = order.get(k + 1).map_or(data_len, |&j| infos[j].1);
+            sizes[i] = next.saturating_sub(infos[i].1);
+        }
+        let tensors = infos.into_iter().zip(sizes).map(|((n, _), s)| (n, s)).collect();
+        Ok(Gguf { kv, tensors })
+    }
+
+    /// Bytes of all tensors whose name starts with `prefix`.
+    pub fn tensor_bytes(&self, prefix: &str) -> u64 {
+        self.tensors.iter().filter(|(n, _)| n.starts_with(prefix)).map(|(_, s)| s).sum()
     }
 
     pub fn arch(&self) -> Option<&str> {
@@ -198,10 +238,15 @@ pub mod testfile {
     }
 
     pub fn build(kvs: &[(&str, V)]) -> Vec<u8> {
+        build_with_tensors(kvs, &[])
+    }
+
+    /// A GGUF file with f32 tensors of the given byte sizes (multiples of 32), data zeroed.
+    pub fn build_with_tensors(kvs: &[(&str, V)], tensors: &[(&str, u64)]) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(b"GGUF");
         b.extend_from_slice(&3u32.to_le_bytes());
-        b.extend_from_slice(&0u64.to_le_bytes());
+        b.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
         b.extend_from_slice(&(kvs.len() as u64).to_le_bytes());
         let s = |b: &mut Vec<u8>, t: &str| {
             b.extend_from_slice(&(t.len() as u64).to_le_bytes());
@@ -248,6 +293,19 @@ pub mod testfile {
                 }
             }
         }
+        let mut offset = 0u64;
+        for (name, size) in tensors {
+            s(&mut b, name);
+            b.extend_from_slice(&1u32.to_le_bytes());
+            b.extend_from_slice(&(size / 4).to_le_bytes());
+            b.extend_from_slice(&0u32.to_le_bytes()); // f32
+            b.extend_from_slice(&offset.to_le_bytes());
+            offset += size;
+        }
+        while b.len() % 32 != 0 {
+            b.push(0);
+        }
+        b.resize(b.len() + offset as usize, 0);
         b
     }
 }
@@ -276,5 +334,20 @@ mod tests {
         assert_eq!(g.array("attention.sliding_window_pattern"), Some(&[1.0, 0.0][..]));
         assert_eq!(g.len_of("tokenizer.ggml.tokens"), Some(3));
         assert!(Gguf::parse(&mut std::io::Cursor::new(b"GGML....".to_vec())).is_err());
+        assert!(g.tensors.is_empty());
+    }
+
+    #[test]
+    fn tensor_sizes_come_from_the_offsets() {
+        use super::testfile::build_with_tensors;
+        let bytes = build_with_tensors(
+            &[("general.architecture", V::Str("gemma3n"))],
+            &[("token_embd.weight", 1024), ("per_layer_token_embd.weight", 4096), ("blk.0.attn_q.weight", 64)],
+        );
+        let g = Gguf::parse(&mut std::io::Cursor::new(bytes)).unwrap();
+        assert_eq!(g.tensors.len(), 3);
+        assert_eq!(g.tensors[1], ("per_layer_token_embd.weight".to_string(), 4096));
+        assert_eq!(g.tensor_bytes("per_layer_token_embd"), 4096);
+        assert_eq!(g.tensors.iter().map(|t| t.1).sum::<u64>(), 1024 + 4096 + 64);
     }
 }

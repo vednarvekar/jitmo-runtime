@@ -69,6 +69,33 @@ pub async fn chat_once(client: &HttpClient, port: u16, body: &Value) -> Result<V
     Ok(v)
 }
 
+/// Make the request's LoRA list complete: one entry per loaded adapter, scale 0 for every
+/// adapter the request does not name. llama.cpp (build 12248) applies an adapter that a request
+/// leaves out at its load-time scale (1.0), even with `--lora-init-without-apply`, so a request
+/// without `lora` would otherwise run with every adapter on (measured 22 Nov 2026).
+pub fn full_lora(req: &mut Value, n_adapters: usize) -> Result<(), Error> {
+    if n_adapters == 0 {
+        return Ok(());
+    }
+    let mut scales = vec![0.0f64; n_adapters];
+    match req.get("lora") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(items)) => {
+            for it in items {
+                let id = it["id"].as_u64().ok_or_else(|| Error::bad_request("each 'lora' entry needs a numeric 'id'"))? as usize;
+                let scale = it["scale"].as_f64().ok_or_else(|| Error::bad_request("each 'lora' entry needs a numeric 'scale'"))?;
+                if id >= n_adapters {
+                    return Err(Error::bad_request(format!("'lora' id {id} does not exist; this model has {n_adapters} adapter(s), ids 0 to {}", n_adapters - 1)));
+                }
+                scales[id] = scale;
+            }
+        }
+        Some(_) => return Err(Error::bad_request("'lora' must be an array of {\"id\", \"scale\"}")),
+    }
+    req["lora"] = Value::Array(scales.into_iter().enumerate().map(|(id, scale)| serde_json::json!({ "id": id, "scale": scale })).collect());
+    Ok(())
+}
+
 /// The assistant text of a chat completion.
 pub fn content(v: &Value) -> String {
     v["choices"][0]["message"]["content"].as_str().unwrap_or("").trim().to_string()
@@ -149,6 +176,21 @@ impl SseTracker {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_lora_list_is_always_complete() {
+        let mut none = json!({ "messages": [] });
+        full_lora(&mut none, 2).unwrap();
+        assert_eq!(none["lora"], json!([{ "id": 0, "scale": 0.0 }, { "id": 1, "scale": 0.0 }]));
+        let mut one = json!({ "lora": [{ "id": 1, "scale": 0.5 }] });
+        full_lora(&mut one, 2).unwrap();
+        assert_eq!(one["lora"], json!([{ "id": 0, "scale": 0.0 }, { "id": 1, "scale": 0.5 }]));
+        let mut bad = json!({ "lora": [{ "id": 2, "scale": 1.0 }] });
+        assert_eq!(full_lora(&mut bad, 2).unwrap_err().status, 400);
+        let mut untouched = json!({ "x": 1 });
+        full_lora(&mut untouched, 0).unwrap();
+        assert!(untouched.get("lora").is_none());
+    }
 
     #[test]
     fn timings_are_read_from_timings_or_usage() {

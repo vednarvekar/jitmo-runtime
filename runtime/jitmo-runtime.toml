@@ -1,13 +1,19 @@
-# jitmo-runtime v0.1 config. Every key is optional; the values below are the defaults unless
+# jitmo-runtime v0.2 config. Every key is optional; the values below are the defaults unless
 # marked "example". Relative paths are relative to this file. Reference: docs/06-runtime-api.md
+#
+# One model: the [model] table below. Several models (a pool): use [[models]] entries instead,
+# each with the same keys plus name, kind ("chat" | "embedding"), pinned. See the docs.
 
 [server]
 host = "127.0.0.1"
-port = 8090
-max_queue = 8              # requests that may wait while one generation runs
+port = 8090                # 0 = any free port (printed as JITMO_RUNTIME_LISTENING port=<n>)
+max_queue = 8              # requests that may wait for a generation slot
+max_concurrent = 1         # generations at the same time across all models (they share RAM bandwidth)
 
 [model]
 name = "jitmo-base"        # the model id clients send
+kind = "chat"              # or "embedding" (llama-server --embeddings; POST /v1/embeddings)
+pinned = false             # true = never evicted for another model, never idle-unloaded
 path = 'V:\jitmo-sandbox\models\Qwen3-4B-Instruct-2507-Q4_K_M.gguf'
 llama_server = 'V:\jitmo-sandbox\llama\llama-server.exe'
 port = 0                   # private port of the llama-server child; 0 = any free port
@@ -22,8 +28,9 @@ cache_ram_mb = 256         # llama-server prompt cache in RAM (--cache-ram); cou
 ctx_checkpoints = 4        # SWA/hybrid context checkpoints per slot (--ctx-checkpoints); counted in the auto cap
 # example: Qwen3-family templates read this; it turns "thinking" off. Unknown keys are ignored.
 chat_template_kwargs = { enable_thinking = false }
+adapters = []              # LoRA files loaded with the model (scale 0); requests pick them by id
 extra_args = []
-log_file = "llama-server.log"
+# log_file = "llama-server.log"   # default: llama-server.log (one model), llama-server-<name>.log (several)
 load_timeout_secs = 180
 
 [budget]
@@ -31,21 +38,25 @@ memory_cap_mb = "auto"     # Job Object commit (private bytes) cap on the child:
                            # the GGUF metadata and ctx (KV + state + buffers + caches + 640 MiB), a number = MiB, 0 = none.
                            # mmap'd weights are NOT counted: this bounds KV cache + buffers.
 reserve_free_mb = 1536     # refuse to load if less than this would stay free
-load_estimate_mb = 0       # 0 = model file size + memory cap
+load_estimate_mb = 0       # 0 = estimate: private (auto cap) + mapped file minus on-disk tensors (Gemma 3n PLE)
+pool_budget_mb = 0         # total load estimate of loaded models; 0 = no limit (free-RAM check only)
 pressure_free_mb = 1024    # below this twice in a row: finish the running generation, then unload
 critical_free_mb = 500     # below this once: unload at once, even mid-generation; 0 = never
 idle_unload_secs = 90      # unload after this long without requests; 0 = never
 watch_interval_ms = 1000
 
-[pacer]                    # "don't freeze the PC": cap the model's CPU while the user is busy
-mode = "auto"              # auto | always | off
+[pacer]                    # "don't freeze the PC": cap the models' CPU when other programs need it
+mode = "auto"              # auto | always (heavy level all the time) | off
 poll_ms = 300
-input_active_ms = 5000     # keyboard/mouse input this recently = user active; 0 = ignore
-others_cpu_busy_pct = 10.0 # other processes above this % of all logical CPUs = busy; 0 = ignore
-low_free_mb = 2048         # free RAM below this = busy; 0 = ignore
-busy_cpu_pct = 50          # while busy the model gets this % of its normal CPU (Job Object hard cap)
-busy_priority = "unchanged" # or "idle": also drop the child to idle priority while busy
-release_after_ms = 2000    # keep the cap this long after the last busy sample
+smooth_ms = 1500           # other programs' CPU is averaged over this long
+light_cpu_pct = 15.0       # other programs above this % of all logical CPUs: light level
+heavy_cpu_pct = 40.0       # above this, or free RAM below low_free_mb: heavy level
+low_free_mb = 0            # 0 = budget.pressure_free_mb
+light_cap_pct = 75         # light level: the model gets this % of its normal CPU (Job Object hard cap)
+heavy_cap_pct = 50         # heavy level
+hysteresis_pct = 5.0       # to go down a level, CPU must be this many points under the threshold
+release_after_ms = 5000    # a level holds at least this long before it goes down
+busy_priority = "unchanged" # or "idle": also drop the children to idle priority while capped
 
 # ---- example chain: works with no adapters ----
 [[chains]]
