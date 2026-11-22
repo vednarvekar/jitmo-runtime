@@ -1,4 +1,4 @@
-# jitmo-runtime v0.2 config. Every key is optional; the values below are the defaults unless
+# jitmo-runtime v0.3 config. Every key is optional; the values below are the defaults unless
 # marked "example". Relative paths are relative to this file. Reference: docs/06-runtime-api.md
 #
 # One model: the [model] table below. Several models (a pool): use [[models]] entries instead,
@@ -38,10 +38,13 @@ memory_cap_mb = "auto"     # Job Object commit (private bytes) cap on the child:
                            # the GGUF metadata and ctx (KV + state + buffers + caches + 640 MiB), a number = MiB, 0 = none.
                            # mmap'd weights are NOT counted: this bounds KV cache + buffers.
 reserve_free_mb = 1536     # refuse to load if less than this would stay free
-load_estimate_mb = 0       # 0 = estimate: private (auto cap) + mapped file minus on-disk tensors (Gemma 3n PLE)
+load_estimate_mb = 0       # 0 = estimate: private (KV + state + buffers + prompt cache + checkpoints + 96 MiB + 5% of
+                           # the weights) + mapped file minus on-disk tensors (Gemma 3n PLE). Not the cap: no 640 MiB.
 pool_budget_mb = 0         # total load estimate of loaded models; 0 = no limit (free-RAM check only)
 pressure_free_mb = 1024    # below this twice in a row: finish the running generation, then unload
 critical_free_mb = 500     # below this once: unload at once, even mid-generation; 0 = never
+pressure_finish_max_ms = 15000 # under pressure, a generation may finish for at most this long; then (if RAM
+                           # is still short) it is cancelled with a memory_pressure error and the model unloaded. 0 = no limit
 idle_unload_secs = 90      # unload after this long without requests; 0 = never
 watch_interval_ms = 1000
 
@@ -49,13 +52,15 @@ watch_interval_ms = 1000
 mode = "auto"              # auto | always (heavy level all the time) | off
 poll_ms = 300
 smooth_ms = 1500           # other programs' CPU is averaged over this long
-light_cpu_pct = 15.0       # other programs above this % of all logical CPUs: light level
+light_cpu_pct = 20.0       # other programs above this % of all logical CPUs: light level
 heavy_cpu_pct = 40.0       # above this, or free RAM below low_free_mb: heavy level
 low_free_mb = 0            # 0 = budget.pressure_free_mb
 light_cap_pct = 75         # light level: the model gets this % of its normal CPU (Job Object hard cap)
 heavy_cap_pct = 50         # heavy level
 hysteresis_pct = 5.0       # to go down a level, CPU must be this many points under the threshold
 release_after_ms = 5000    # a level holds at least this long before it goes down
+heavy_hysteresis_pct = 10.0 # to leave heavy, CPU must be this many points under heavy_cpu_pct
+heavy_release_after_ms = 10000 # heavy goes down only after CPU and RAM stayed clear of it this long in a row
 busy_priority = "unchanged" # or "idle": also drop the children to idle priority while capped
 
 # ---- example chain: works with no adapters ----

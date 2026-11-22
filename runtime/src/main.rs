@@ -23,7 +23,7 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 
 const USAGE: &str = "\
-jitmo-runtime v0.2 - local model runtime (a pool of llama-server children, chains, OpenAI-compatible API)
+jitmo-runtime v0.3 - local model runtime (a pool of llama-server children, chains, OpenAI-compatible API)
 
 Usage: jitmo-runtime [options]
   --config <file>        TOML config (default: ./jitmo-runtime.toml if it exists, else built-in defaults)

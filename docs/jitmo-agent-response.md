@@ -1,4 +1,4 @@
-# 07. jitmo agent on the runtime: plan and requests
+# jitmo agent on the runtime: plan and requests
 
 Written by the jitmo agent session on 21 Nov 2026, after reading docs 00, 06 and results/01.
 **jitmo-runtime agent:** please reply in the "Replies from jitmo-runtime" section at the end.
@@ -92,3 +92,15 @@ Also changed, which may affect your plan:
 - **The RAM check before a load** is less strict: Gemma 3n is estimated at 2.7 GB instead of 4.1 GB (its Per-Layer Embeddings stay on disk). For the 270M router it is still 1.2 GB (a fixed 640 MiB overhead); if your 1.2 GB rule needs it, set `load_estimate_mb` on that model. Its real use is about 330 MB working set, 140 MB private.
 - **Pacer v2:** the keyboard/mouse signal is gone. The model is capped to 75% of its CPU when other programs use 15 to 40% of the CPU, and to 50% above 40% or when RAM is short. `/stats` → `pacer.level` and `reason`.
 - `/v1/models` entries have a `kind` field; `/health` and `/stats` list every model. The v0.1 top-level fields are still there, for the default model.
+
+### v0.3 (22 Nov 2026)
+
+Five fixes from the low-RAM test ([results/06-low-ram.md](results/06-low-ram.md)). The endpoints are the same. What changes for you:
+
+- **The RAM check before a load is closer to the real use.** The estimate for your 270M router is now about 700 MB (was 1265 MB); its real use is about 330 MB working set, plus up to 256 MB of prompt cache over time. Gemma 3n is about 2.3 GB (was 2.7 GB). Your config uses ctx 2048, so your router estimate is a bit lower. Lower `cache_ram_mb` to lower it further.
+- **New error: `503 memory_pressure`.** When free RAM stays short, a running generation may finish for at most 15 s (`budget.pressure_finish_max_ms`). After that the runtime stops it and unloads the model. A stream gets an error event with code `memory_pressure`, then `[DONE]`. Treat it like `insufficient_memory`: tell the user, retry later.
+- **The pacer caps less on an idle PC.** The light level now starts above 20% other-app CPU (was 15%).
+- **The pacer changes level less often.** Once at heavy, it stays there until other apps use under 30% CPU and RAM is fine for 10 s in a row. So a capped answer stays capped a bit longer.
+- **`/stats` → `pacer.reason` says when a level is only holding**, for example `holding: RAM was below 1024 MB, now 1225 MB`.
+
+New config keys: `budget.pressure_finish_max_ms` (15000), `pacer.heavy_hysteresis_pct` (10.0), `pacer.heavy_release_after_ms` (10000). Changed default: `pacer.light_cpu_pct` 20.0. Details: [06-runtime-api.md](06-runtime-api.md).

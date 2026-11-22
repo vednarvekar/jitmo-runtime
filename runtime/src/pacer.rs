@@ -20,13 +20,18 @@
 //!
 //! | Level   | When                                                  | Cap (share of the child's own full-speed CPU) |
 //! |---------|-------------------------------------------------------|------|
-//! | `none`  | others < `light_cpu_pct` (15%)                        | none |
-//! | `light` | others 15 to 40%                                      | `light_cap_pct` (75%) |
+//! | `none`  | others < `light_cpu_pct` (20%)                        | none |
+//! | `light` | others 20 to 40%                                      | `light_cap_pct` (75%) |
 //! | `heavy` | others > `heavy_cpu_pct` (40%), or free RAM < `low_free_mb` | `heavy_cap_pct` (50%) |
 //!
 //! Hysteresis: a level goes up at once; it goes down only when the signals are below the
 //! thresholds by `hysteresis_pct` (RAM: 256 MB above `low_free_mb`) and the current level has
 //! held for `release_after_ms`.
+//!
+//! v0.3: heavy lets go later, because light <-> heavy flapped 3 to 9 times per 40 s around the
+//! 40% line (results/06-low-ram.md). To leave heavy, others' CPU must be `heavy_hysteresis_pct`
+//! (10 points) under `heavy_cpu_pct`, RAM must be fine, and both must have stayed so for
+//! `heavy_release_after_ms` (10 s) in a row. While a level holds, the reason says so.
 
 use crate::config::PacerConfig;
 use crate::stats::{round2, RequestTiming};
@@ -76,26 +81,66 @@ pub struct Thresholds {
     pub heavy_cpu_pct: f64,
     pub low_free_mb: u64,
     pub hysteresis_pct: f64,
+    /// Hysteresis for leaving heavy (CPU points under `heavy_cpu_pct`).
+    pub heavy_hysteresis_pct: f64,
+    /// A level holds at least this long after a change before it goes down.
+    pub release_after: Duration,
+    /// Heavy goes down only after the signals stayed clear of it this long in a row.
+    pub heavy_release_after: Duration,
 }
 
-/// What each signal asks for. `margin` lowers the thresholds (used to decide whether a level may
-/// go down), so a signal sitting just under a threshold does not make the level flap.
+impl Thresholds {
+    pub fn from_config(cfg: &PacerConfig, pressure_free_mb: u64) -> Thresholds {
+        Thresholds {
+            light_cpu_pct: cfg.light_cpu_pct,
+            heavy_cpu_pct: cfg.heavy_cpu_pct,
+            low_free_mb: if cfg.low_free_mb > 0 { cfg.low_free_mb } else { pressure_free_mb },
+            hysteresis_pct: cfg.hysteresis_pct,
+            heavy_hysteresis_pct: cfg.heavy_hysteresis_pct,
+            release_after: Duration::from_millis(cfg.release_after_ms),
+            heavy_release_after: Duration::from_millis(cfg.heavy_release_after_ms),
+        }
+    }
+}
+
+/// What each signal asks for. `lowering` lowers the thresholds by the hysteresis (used to
+/// decide whether a level may go down), so a signal sitting just under a threshold does not
+/// make the level flap. A signal that is only inside that margin says it is holding.
 fn proposals(t: &Thresholds, s: &Signals, lowering: bool) -> Vec<(Level, String)> {
-    let (cpu_margin, ram_margin) = if lowering { (t.hysteresis_pct, RAM_HYSTERESIS_MB) } else { (0.0, 0) };
+    let (light_margin, heavy_margin, ram_margin) =
+        if lowering { (t.hysteresis_pct, t.heavy_hysteresis_pct, RAM_HYSTERESIS_MB) } else { (0.0, 0.0, 0) };
+    let cpu = |pct: f64, limit: f64| {
+        if pct > limit {
+            format!("other processes use {pct:.0}% CPU (> {limit:.0}%)")
+        } else {
+            format!("holding: other processes used over {limit:.0}% CPU, now {pct:.0}%")
+        }
+    };
     let mut out = Vec::new();
     if let Some(pct) = s.others_cpu_pct {
-        if t.heavy_cpu_pct > 0.0 && pct > t.heavy_cpu_pct - cpu_margin {
-            out.push((Level::Heavy, format!("other processes use {pct:.0}% CPU (> {:.0}%)", t.heavy_cpu_pct)));
-        } else if t.light_cpu_pct > 0.0 && pct > t.light_cpu_pct - cpu_margin {
-            out.push((Level::Light, format!("other processes use {pct:.0}% CPU (> {:.0}%)", t.light_cpu_pct)));
+        if t.heavy_cpu_pct > 0.0 && pct > t.heavy_cpu_pct - heavy_margin {
+            out.push((Level::Heavy, cpu(pct, t.heavy_cpu_pct)));
+        } else if t.light_cpu_pct > 0.0 && pct > t.light_cpu_pct - light_margin {
+            out.push((Level::Light, cpu(pct, t.light_cpu_pct)));
         }
     }
     if let Some(free) = s.free_mb {
         if t.low_free_mb > 0 && free < t.low_free_mb + ram_margin {
-            out.push((Level::Heavy, format!("{free} MB RAM free (< {} MB)", t.low_free_mb)));
+            let why = if free < t.low_free_mb {
+                format!("{free} MB RAM free (< {} MB)", t.low_free_mb)
+            } else {
+                format!("holding: RAM was below {} MB, now {free} MB", t.low_free_mb)
+            };
+            out.push((Level::Heavy, why));
         }
     }
     out
+}
+
+/// True if the signals keep heavy from going down (heavy, with the hysteresis margin). The
+/// pacer notes the last sample where this was true: heavy lets go only `heavy_release_after` later.
+pub fn holds_heavy(t: &Thresholds, s: &Signals) -> bool {
+    highest(proposals(t, s, true)).0 == Level::Heavy
 }
 
 fn highest(p: Vec<(Level, String)>) -> (Level, Option<String>) {
@@ -103,17 +148,28 @@ fn highest(p: Vec<(Level, String)>) -> (Level, Option<String>) {
 }
 
 /// The next level: up at once to what the signals ask for; down only when the signals ask
-/// for less even with the hysteresis margin, and the current level has held `release_after`.
-pub fn next_level(t: &Thresholds, current: Level, s: &Signals, held: Duration, release_after: Duration) -> (Level, Option<String>) {
+/// for less even with the hysteresis margin, and the current level has held long enough:
+/// `held` (since the last change) >= `release_after`, and for heavy also `quiet` (since the
+/// last sample where `holds_heavy` was true) >= `heavy_release_after`.
+pub fn next_level(t: &Thresholds, current: Level, s: &Signals, held: Duration, quiet: Duration) -> (Level, Option<String>) {
     let (up, why_up) = highest(proposals(t, s, false));
     if up >= current {
         return (up, why_up);
     }
     let (down, why_down) = highest(proposals(t, s, true));
-    if down < current && held >= release_after {
+    if down >= current {
+        return (current, why_down); // inside the hysteresis margin: the reason says "holding"
+    }
+    let wait = if current == Level::Heavy {
+        t.release_after.saturating_sub(held).max(t.heavy_release_after.saturating_sub(quiet))
+    } else {
+        t.release_after.saturating_sub(held)
+    };
+    if wait.is_zero() {
         return (down, why_down);
     }
-    (current, why_down.or(why_up))
+    let now = why_down.or(why_up).unwrap_or_else(|| "the signals are under the thresholds".into());
+    (current, Some(format!("holding {} for {:.0} s more; now {now}", current.as_str(), wait.as_secs_f64().ceil())))
 }
 
 /// The Job Object CpuRate (cycles per 10000 of all logical processors) that gives a child
@@ -192,6 +248,8 @@ struct Inner {
     level: Level,
     reason: Option<String>,
     level_since: Option<Instant>,
+    /// Last sample where the signals held heavy (see `holds_heavy`).
+    heavy_seen: Option<Instant>,
     at_level: [Duration; 3],
     last_tick: Option<Instant>,
     level_changes: u64,
@@ -230,12 +288,7 @@ impl Pacer {
             }
         }
         let base_priority = if low_priority { win::BELOW_NORMAL_PRIORITY_CLASS } else { win::NORMAL_PRIORITY_CLASS };
-        let t = Thresholds {
-            light_cpu_pct: cfg.light_cpu_pct,
-            heavy_cpu_pct: cfg.heavy_cpu_pct,
-            low_free_mb: if cfg.low_free_mb > 0 { cfg.low_free_mb } else { pressure_free_mb },
-            hysteresis_pct: cfg.hysteresis_pct,
-        };
+        let t = Thresholds::from_config(&cfg, pressure_free_mb);
         Pacer { cfg, t, logical, base_priority, inner: Mutex::new(Inner::default()) }
     }
 
@@ -322,13 +375,16 @@ impl Pacer {
             free_mb: win::memory_status().map(|m| m.avail / (1024 * 1024)),
         };
 
+        if i.signals.others_cpu_pct.is_some() && holds_heavy(&self.t, &i.signals) {
+            i.heavy_seen = Some(now);
+        }
         let held = i.level_since.map_or(Duration::MAX, |t| now - t);
-        let release = Duration::from_millis(self.cfg.release_after_ms);
+        let quiet = i.heavy_seen.map_or(Duration::MAX, |t| now - t);
         let (want, reason) = match self.cfg.mode.as_str() {
             "off" => (Level::None, None),
             "always" => (Level::Heavy, Some("pacer.mode = always".to_string())),
             _ if i.signals.others_cpu_pct.is_none() => (i.level, i.reason.clone()), // no CPU reading this tick: keep
-            _ => next_level(&self.t, i.level, &i.signals, held, release),
+            _ => next_level(&self.t, i.level, &i.signals, held, quiet),
         };
         let want = if children.is_empty() { Level::None } else { want };
 
@@ -428,6 +484,7 @@ impl Pacer {
                 "light_cpu_pct": self.t.light_cpu_pct, "heavy_cpu_pct": self.t.heavy_cpu_pct, "low_free_mb": self.t.low_free_mb,
                 "light_cap_pct": self.cfg.light_cap_pct, "heavy_cap_pct": self.cfg.heavy_cap_pct,
                 "hysteresis_pct": self.t.hysteresis_pct, "smooth_ms": self.cfg.smooth_ms, "release_after_ms": self.cfg.release_after_ms,
+                "heavy_hysteresis_pct": self.t.heavy_hysteresis_pct, "heavy_release_after_ms": self.cfg.heavy_release_after_ms,
             }),
             busy_priority: self.cfg.busy_priority.clone(),
             secs_at_level: json!({
@@ -450,13 +507,22 @@ mod tests {
     use super::*;
 
     fn t() -> Thresholds {
-        Thresholds { light_cpu_pct: 15.0, heavy_cpu_pct: 40.0, low_free_mb: 1024, hysteresis_pct: 5.0 }
+        Thresholds {
+            light_cpu_pct: 20.0,
+            heavy_cpu_pct: 40.0,
+            low_free_mb: 1024,
+            hysteresis_pct: 5.0,
+            heavy_hysteresis_pct: 10.0,
+            release_after: RELEASE,
+            heavy_release_after: HEAVY_RELEASE,
+        }
     }
     fn s(cpu: f64, free: u64) -> Signals {
         Signals { others_cpu_pct: Some(cpu), free_mb: Some(free) }
     }
-    const HELD: Duration = Duration::from_secs(10);
+    const HELD: Duration = Duration::from_secs(20);
     const RELEASE: Duration = Duration::from_millis(2000);
+    const HEAVY_RELEASE: Duration = Duration::from_millis(10_000);
 
     #[test]
     fn the_cap_is_a_share_of_the_childs_own_cpu() {
@@ -470,34 +536,140 @@ mod tests {
     #[test]
     fn levels_follow_cpu_and_ram() {
         let t = t();
-        let n = |c, f| next_level(&t, Level::None, &s(c, f), HELD, RELEASE).0;
+        let n = |c, f| next_level(&t, Level::None, &s(c, f), HELD, HELD).0;
         assert_eq!(n(5.0, 6000), Level::None);
-        assert_eq!(n(15.0, 6000), Level::None, "15% is not above 15%");
-        assert_eq!(n(20.0, 6000), Level::Light);
+        assert_eq!(n(20.0, 6000), Level::None, "20% is not above 20%");
+        assert_eq!(n(25.0, 6000), Level::Light);
         assert_eq!(n(40.0, 6000), Level::Light);
         assert_eq!(n(41.0, 6000), Level::Heavy);
         assert_eq!(n(5.0, 900), Level::Heavy, "low RAM alone is heavy");
-        let (_, why) = next_level(&t, Level::None, &s(25.0, 900), HELD, RELEASE);
+        let (_, why) = next_level(&t, Level::None, &s(25.0, 900), HELD, HELD);
         assert!(why.unwrap().contains("RAM"), "the highest level's reason wins");
-        assert_eq!(next_level(&t, Level::None, &Signals::default(), HELD, RELEASE).0, Level::None, "no signals = none");
+        assert_eq!(next_level(&t, Level::None, &Signals::default(), HELD, HELD).0, Level::None, "no signals = none");
+        assert_eq!(PacerConfig::default().light_cpu_pct, 20.0, "v0.3 default");
     }
 
     #[test]
     fn hysteresis_and_hold_stop_flapping() {
         let t = t();
         // Up at once, even right after a change.
-        assert_eq!(next_level(&t, Level::None, &s(50.0, 6000), Duration::ZERO, RELEASE).0, Level::Heavy);
-        // Down only below threshold - 5 ...
-        assert_eq!(next_level(&t, Level::Heavy, &s(37.0, 6000), HELD, RELEASE).0, Level::Heavy);
-        assert_eq!(next_level(&t, Level::Heavy, &s(34.0, 6000), HELD, RELEASE).0, Level::Light);
-        assert_eq!(next_level(&t, Level::Light, &s(12.0, 6000), HELD, RELEASE).0, Level::Light);
-        assert_eq!(next_level(&t, Level::Light, &s(9.0, 6000), HELD, RELEASE).0, Level::None);
-        assert_eq!(next_level(&t, Level::Heavy, &s(2.0, 6000), HELD, RELEASE).0, Level::None, "may drop two levels");
-        // ... and only after the level held for release_after.
-        assert_eq!(next_level(&t, Level::Heavy, &s(2.0, 6000), Duration::from_millis(500), RELEASE).0, Level::Heavy);
+        assert_eq!(next_level(&t, Level::None, &s(50.0, 6000), Duration::ZERO, Duration::ZERO).0, Level::Heavy);
+        // Heavy goes down only below 40 - 10 ...
+        assert_eq!(next_level(&t, Level::Heavy, &s(31.0, 6000), HELD, HELD).0, Level::Heavy);
+        assert_eq!(next_level(&t, Level::Heavy, &s(29.0, 6000), HELD, HELD).0, Level::Light);
+        // ... light below 20 - 5.
+        assert_eq!(next_level(&t, Level::Light, &s(16.0, 6000), HELD, HELD).0, Level::Light);
+        assert_eq!(next_level(&t, Level::Light, &s(14.0, 6000), HELD, HELD).0, Level::None);
+        assert_eq!(next_level(&t, Level::Heavy, &s(2.0, 6000), HELD, HELD).0, Level::None, "may drop two levels");
+        // Light needs release_after since the change; heavy also heavy_release_after of quiet.
+        assert_eq!(next_level(&t, Level::Light, &s(2.0, 6000), Duration::from_millis(500), HELD).0, Level::Light);
+        assert_eq!(next_level(&t, Level::Heavy, &s(2.0, 6000), Duration::from_millis(500), HELD).0, Level::Heavy);
+        let (l, why) = next_level(&t, Level::Heavy, &s(2.0, 6000), HELD, Duration::from_secs(4));
+        assert_eq!(l, Level::Heavy);
+        assert!(why.as_deref().unwrap().starts_with("holding heavy for 6 s more"), "{why:?}");
         // RAM lets go 256 MB above the floor.
-        assert_eq!(next_level(&t, Level::Heavy, &s(2.0, 1100), HELD, RELEASE).0, Level::Heavy);
-        assert_eq!(next_level(&t, Level::Heavy, &s(2.0, 1400), HELD, RELEASE).0, Level::None);
+        assert_eq!(next_level(&t, Level::Heavy, &s(2.0, 1100), HELD, HELD).0, Level::Heavy);
+        assert_eq!(next_level(&t, Level::Heavy, &s(2.0, 1400), HELD, HELD).0, Level::None);
+    }
+
+    #[test]
+    fn a_held_level_says_it_is_holding() {
+        let t = t();
+        // RAM inside the 256 MB margin (results/06-low-ram.md: "1225 MB RAM free (< 1024 MB)").
+        let (l, why) = next_level(&t, Level::Heavy, &s(2.0, 1225), HELD, HELD);
+        assert_eq!(l, Level::Heavy);
+        assert_eq!(why.as_deref(), Some("holding: RAM was below 1024 MB, now 1225 MB"));
+        // Really below the floor: the plain reason.
+        let (_, why) = next_level(&t, Level::Heavy, &s(2.0, 900), HELD, HELD);
+        assert_eq!(why.as_deref(), Some("900 MB RAM free (< 1024 MB)"));
+        // CPU inside the margin.
+        let (_, why) = next_level(&t, Level::Heavy, &s(35.0, 6000), HELD, HELD);
+        assert_eq!(why.as_deref(), Some("holding: other processes used over 40% CPU, now 35%"));
+        let (_, why) = next_level(&t, Level::Light, &s(17.0, 6000), HELD, HELD);
+        assert_eq!(why.as_deref(), Some("holding: other processes used over 20% CPU, now 17%"));
+        let (_, why) = next_level(&t, Level::Light, &s(45.0, 6000), HELD, HELD);
+        assert_eq!(why.as_deref(), Some("other processes use 45% CPU (> 40%)"));
+        // Waiting for the hold time.
+        let (_, why) = next_level(&t, Level::Light, &s(2.0, 6000), Duration::from_millis(500), HELD);
+        assert!(why.as_deref().unwrap().starts_with("holding light for 2 s more"), "{why:?}");
+    }
+
+    /// Feeds a CPU series to the decision the way `Pacer::tick` does (one sample per `poll`),
+    /// and returns the number of level changes.
+    fn simulate(t: &Thresholds, series: &[f64], poll: Duration) -> u32 {
+        let start = Instant::now();
+        let (mut level, mut since, mut heavy_seen, mut changes) = (Level::None, None::<Instant>, None::<Instant>, 0);
+        for (k, &cpu) in series.iter().enumerate() {
+            let now = start + poll * k as u32;
+            let sig = s(cpu, 6000);
+            if holds_heavy(t, &sig) {
+                heavy_seen = Some(now);
+            }
+            let held = since.map_or(Duration::MAX, |x| now - x);
+            let quiet = heavy_seen.map_or(Duration::MAX, |x| now - x);
+            let (want, _) = next_level(t, level, &sig, held, quiet);
+            if want != level {
+                changes += 1;
+                level = want;
+                since = Some(now);
+            }
+        }
+        changes
+    }
+
+    /// A noisy series: `center` +/- `spread`, from a fixed pseudo-random sequence.
+    fn noisy(center: f64, spread: f64, n: usize, seed: u64) -> Vec<f64> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let u = (x >> 11) as f64 / (1u64 << 53) as f64; // 0..1
+                center + spread * (2.0 * u - 1.0)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn noisy_cpu_around_the_heavy_line_changes_level_rarely() {
+        let poll = Duration::from_millis(300);
+        let n = 134; // 40 s
+        // v0.2 behaviour: 5 points, 5 s hold since the change, no quiet time for heavy.
+        let old = Thresholds {
+            light_cpu_pct: 15.0,
+            hysteresis_pct: 5.0,
+            heavy_hysteresis_pct: 5.0,
+            release_after: Duration::from_secs(5),
+            heavy_release_after: Duration::ZERO,
+            ..t()
+        };
+        let new = Thresholds::from_config(&PacerConfig::default(), 1024);
+        assert_eq!((new.heavy_hysteresis_pct, new.heavy_release_after), (10.0, Duration::from_secs(10)));
+        let mut old_total = 0;
+        for seed in 1..=5 {
+            for (center, spread) in [(40.0, 8.0), (38.0, 10.0), (40.0, 14.0)] {
+                let series = noisy(center, spread, n, seed);
+                let (o, c) = (simulate(&old, &series, poll), simulate(&new, &series, poll));
+                old_total += o;
+                eprintln!("seed {seed}, {center} +/- {spread}: v0.2 rules {o} changes, v0.3 rules {c}");
+                assert!(c <= 2, "seed {seed}, {center} +/- {spread}: {c} changes in 40 s (v0.2 rules: {o})");
+            }
+        }
+        assert!(old_total >= 15 * 2, "the v0.2 rules flap on these series ({old_total} changes in 15 runs)");
+    }
+
+    #[test]
+    fn heavy_lets_go_after_a_quiet_spell() {
+        let poll = Duration::from_millis(300);
+        let t = Thresholds::from_config(&PacerConfig::default(), 1024);
+        // 10 s busy, then 20 s at about 10%: up once, down once (to none) after about 10 s.
+        let mut series = noisy(50.0, 5.0, 34, 7);
+        series.extend(noisy(10.0, 3.0, 67, 8));
+        assert_eq!(simulate(&t, &series, poll), 2);
+        // Quiet for only 6 s between two busy spells: heavy holds the whole time.
+        let mut series = noisy(50.0, 5.0, 34, 9);
+        series.extend(noisy(10.0, 3.0, 20, 10));
+        series.extend(noisy(50.0, 5.0, 34, 11));
+        assert_eq!(simulate(&t, &series, poll), 1);
     }
 
     #[test]

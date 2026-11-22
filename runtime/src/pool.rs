@@ -17,7 +17,7 @@ use crate::config::{Config, ModelConfig, ModelKind};
 use crate::error::Error;
 use crate::llama::{self, HttpClient};
 use crate::pacer::{self, Pacer};
-use crate::sched::{Permit, RequestGuard, Requests, Scheduler};
+use crate::sched::{CancelToken, Permit, RequestGuard, Requests, Scheduler};
 use crate::stats::{mb, Stats, UnloadReason};
 use crate::win::{self, Job, LowMemorySignal, ProcessMemory, HANDLE};
 use hyper::StatusCode;
@@ -105,6 +105,10 @@ pub struct ModelHandle {
     last_activity: Mutex<Instant>,
     /// Memory pressure was seen while it was in use: unload before its next use.
     pending_unload: AtomicBool,
+    /// When `pending_unload` was set (for `budget.pressure_finish_max_ms`).
+    pending_since: Mutex<Option<Instant>>,
+    /// Cancel tokens of the requests that use the model now (by use id).
+    users: Mutex<Vec<(u64, CancelToken)>>,
     counters: Mutex<ModelCounters>,
 }
 
@@ -128,6 +132,8 @@ impl ModelHandle {
             last_used: Mutex::new(None),
             last_activity: Mutex::new(Instant::now()),
             pending_unload: AtomicBool::new(false),
+            pending_since: Mutex::new(None),
+            users: Mutex::new(Vec::new()),
             counters: Mutex::new(ModelCounters::default()),
         }
     }
@@ -212,10 +218,14 @@ fn record_peaks(stats: &Stats, mem: &ProcessMemory, job: &Job) {
 pub struct ModelUse {
     _guard: OwnedRwLockReadGuard<()>,
     model: Arc<ModelHandle>,
+    id: u64,
 }
+
+static NEXT_USE: AtomicU64 = AtomicU64::new(1);
 
 impl Drop for ModelUse {
     fn drop(&mut self) {
+        lock(&self.model.users).retain(|(id, _)| *id != self.id);
         self.model.touch();
         self.model.active.fetch_sub(1, Ordering::SeqCst);
     }
@@ -321,12 +331,13 @@ impl Pool {
         };
         let queue_ms = t0.elapsed().as_secs_f64() * 1000.0;
         req.set_running();
-        let (u, port, load_ms) = self.use_model(m).await?;
+        let (u, port, load_ms) = self.use_model(m, Some(&req.token)).await?;
         Ok(Slot { model: m.clone(), _use: u, _permit: permit, port, queue_ms, load_ms })
     }
 
     /// Hold the model (load it if needed). Returns the hold, the child's port and the load time.
-    pub async fn use_model(&self, m: &Arc<ModelHandle>) -> Result<(ModelUse, u16, f64), Error> {
+    /// `token` = the request's cancel token, so memory pressure can stop it (see `force_pressure_unload`).
+    pub async fn use_model(&self, m: &Arc<ModelHandle>, token: Option<&CancelToken>) -> Result<(ModelUse, u16, f64), Error> {
         if m.pending_unload.load(Ordering::SeqCst) {
             let _w = m.use_lock.write().await;
             if m.pending_unload.swap(false, Ordering::SeqCst) {
@@ -337,7 +348,11 @@ impl Pool {
         let guard = m.use_lock.clone().read_owned().await;
         m.active.fetch_add(1, Ordering::SeqCst);
         m.touch();
-        let u = ModelUse { _guard: guard, model: m.clone() };
+        let id = NEXT_USE.fetch_add(1, Ordering::Relaxed);
+        if let Some(t) = token {
+            lock(&m.users).push((id, t.clone()));
+        }
+        let u = ModelUse { _guard: guard, model: m.clone(), id };
         let (port, load_ms) = self.ensure_loaded(m).await?;
         Ok((u, port, load_ms))
     }
@@ -574,6 +589,7 @@ impl Pool {
         *lock(&m.info) = None;
         m.set_phase(Phase::Unloaded);
         m.pending_unload.store(false, Ordering::SeqCst);
+        *lock(&m.pending_since) = None;
         self.stats.unloaded(reason);
         info!(
             "model '{}' unloaded ({}); child peak working set {:.0} MB, peak private {:.0} MB",
@@ -638,12 +654,17 @@ impl Pool {
                     return;
                 }
                 MemoryAction::UnloadWhenFree(why) => {
+                    let max_ms = self.cfg.budget.pressure_finish_max_ms;
                     for m in &loaded {
                         if let Ok(_w) = m.use_lock.clone().try_write_owned() {
                             warn!("memory pressure ({why}): unloading model '{}' now", m.name());
                             self.unload(m, UnloadReason::MemoryPressure).await;
                         } else if !m.pending_unload.swap(true, Ordering::SeqCst) {
-                            warn!("memory pressure ({why}): model '{}' may finish its generation, then it is unloaded", m.name());
+                            *lock(&m.pending_since) = Some(Instant::now());
+                            let limit = if max_ms > 0 { format!(" (at most {:.0} s)", max_ms as f64 / 1000.0) } else { String::new() };
+                            warn!("memory pressure ({why}): model '{}' may finish its generation{limit}, then it is unloaded", m.name());
+                        } else {
+                            self.check_pressure_wait(m, true).await;
                         }
                     }
                     *low_count = 0;
@@ -652,7 +673,12 @@ impl Pool {
                 MemoryAction::None => {}
             }
         }
+        let still_low = *low_count > 0;
         for m in &loaded {
+            // Pressure seen earlier, the generation still runs: stop it if it ran too long.
+            if m.phase() == Phase::Loaded && self.check_pressure_wait(m, still_low).await {
+                continue;
+            }
             // Pressure seen earlier; the generation has ended and nobody uses the model.
             if m.pending_unload.load(Ordering::SeqCst) {
                 if let Ok(_w) = m.use_lock.clone().try_write_owned() {
@@ -674,6 +700,39 @@ impl Pool {
                 }
             }
         }
+    }
+
+    /// A model waits for its generation to end before a pressure unload. Past
+    /// `budget.pressure_finish_max_ms`, and only while free RAM is still short, cancel the
+    /// requests that use it (they get a `memory_pressure` error) and unload it now.
+    /// Returns true if it unloaded the model.
+    async fn check_pressure_wait(&self, m: &ModelHandle, still_low: bool) -> bool {
+        let since = *lock(&m.pending_since);
+        let waited = since.map(|t| t.elapsed());
+        if !m.pending_unload.load(Ordering::SeqCst) || !budget::pressure_wait_over(waited, self.cfg.budget.pressure_finish_max_ms, still_low) {
+            return false;
+        }
+        let secs = waited.unwrap_or_default().as_secs_f64();
+        let users: Vec<CancelToken> = lock(&m.users).iter().map(|(_, t)| t.clone()).collect();
+        warn!(
+            "memory pressure: model '{}' waited {secs:.0} s for its generation (budget.pressure_finish_max_ms); cancelling {} request(s) and unloading it now",
+            m.name(),
+            users.len()
+        );
+        let e = Error::memory_pressure(format!(
+            "the runtime stopped this generation to unload model '{}': free RAM stayed low for {secs:.0} s. Close some apps and try again",
+            m.name()
+        ));
+        for t in &users {
+            t.cancel_with(e.clone());
+        }
+        // Let the cancelled requests end (they drop their hold); then unload either way.
+        let w = tokio::time::timeout(Duration::from_millis(500), m.use_lock.write()).await;
+        self.unload(m, UnloadReason::MemoryPressure).await;
+        m.pending_unload.store(false, Ordering::SeqCst);
+        *lock(&m.pending_since) = None;
+        drop(w);
+        true
     }
 
     /// The pacer loop: one sample for the whole pool, the cap applies to every loaded child.
@@ -854,5 +913,30 @@ mod tests {
         assert!(a.use_lock.clone().try_write_owned().is_ok());
         assert_eq!(a.idle_unload_secs, 90);
         assert!(a.last_used_secs().is_none());
+    }
+
+    /// A pressure unload past the time limit cancels the requests that hold the model.
+    #[tokio::test]
+    async fn a_model_use_registers_the_request_token() {
+        let p = pool_of("[[models]]
+name = \"a\"
+");
+        let a = p.models[0].clone();
+        let t = CancelToken::default();
+        let guard = a.use_lock.clone().read_owned().await;
+        lock(&a.users).push((7, t.clone()));
+        let u = ModelUse { _guard: guard, model: a.clone(), id: 7 };
+        a.active.fetch_add(1, Ordering::SeqCst);
+        // Not pending: nothing happens.
+        assert!(!p.check_pressure_wait(&a, true).await);
+        a.pending_unload.store(true, Ordering::SeqCst);
+        *lock(&a.pending_since) = Some(Instant::now() - Duration::from_secs(20));
+        assert!(!p.check_pressure_wait(&a, false).await, "RAM is fine again: no cancel");
+        assert!(!t.is_cancelled());
+        assert!(p.check_pressure_wait(&a, true).await, "20 s > 15 s and RAM still low");
+        assert_eq!(t.reason().map(|e| e.code), Some("memory_pressure"));
+        assert!(!a.pending_unload.load(Ordering::SeqCst) && lock(&a.pending_since).is_none());
+        drop(u);
+        assert!(lock(&a.users).is_empty(), "the use leaves the list when it ends");
     }
 }

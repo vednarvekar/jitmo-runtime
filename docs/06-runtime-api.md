@@ -1,4 +1,4 @@
-# 06. Runtime v0.2: API for jitmo agent
+# 06. Runtime v0.3: API for jitmo agent
 
 This doc is for the jitmo agent team. It says what the runtime does, how to start it (also as a child process of your app), how to configure it, and how to call it.
 Code: `runtime/` (Rust). Config: `runtime/jitmo-runtime.toml`. Smoke test: `runtime/scripts/smoke.ps1`. Measurements: [results/04-v0.2.md](results/04-v0.2.md), [results/05-pacer-v2.md](results/05-pacer-v2.md).
@@ -123,7 +123,8 @@ ctx_size = 512
 | `reserve_free_mb` | `1536` | Refuse to load a model if free RAM after loading it would be below this. |
 | `load_estimate_mb` | `0` | RAM a loaded model is expected to take. `0` = estimate it ([below](#load-estimate)). |
 | `pool_budget_mb` | `0` | The load estimates of all loaded models together may not exceed this. `0` = no pool limit; only the free-RAM check applies. |
-| `pressure_free_mb` | `1024` | Memory pressure: free RAM below this on two checks in a row, or Windows' low-memory signal. Idle models are unloaded at once; a model that is generating **finishes first**, then it is unloaded. |
+| `pressure_free_mb` | `1024` | Memory pressure: free RAM below this on two checks in a row, or Windows' low-memory signal. Idle models are unloaded at once; a model that is generating **finishes first** (for at most `pressure_finish_max_ms`), then it is unloaded. |
+| `pressure_finish_max_ms` | `15000` | v0.3. How long a generation may run on under memory pressure. If free RAM is still under `pressure_free_mb` after this, the runtime cancels the requests on that model and unloads it. The client gets `503 memory_pressure` (for a stream: an error event with that code, then `[DONE]`). If RAM recovers in the meantime, the generation may finish. `0` = no limit (v0.2: wait for the end). |
 | `critical_free_mb` | `500` | Free RAM below this on **one** check: unload every model at once, even mid-generation (those requests fail with `engine_error`). `0` = never. Must be below `pressure_free_mb`. |
 | `idle_unload_secs` | `90` | Unload a model after this many seconds without requests. `0` = never. Pinned models are never idle-unloaded. |
 | `watch_interval_ms` | `1000` | How often the watchdog checks idle time, memory and the children. |
@@ -139,30 +140,39 @@ Loads happen one at a time. Before loading model M:
 
 #### Load estimate
 
-What the free-RAM check and the pool budget count for one model (shown in `/stats` → `models[].load_estimate_mb`):
+What the free-RAM check and the pool budget count for one model (shown in `/stats` → `models[].load_estimate_mb`).
+v0.3 made it closer to the real use. It is no longer the memory cap.
 
 ```
 estimate = private + mapped (+ mapped again if no_repack = false)
 
-private = the automatic cap (KV + state + buffers + caches + 640 MiB, below),
-          or memory_cap_mb if set to a number, or 1024 MiB if there is no cap and no estimate
-mapped  = the part of the memory-mapped file that will be in RAM:
-          the whole file, minus tensors llama.cpp leaves on disk.
-          Today that is Gemma 3n's Per-Layer Embeddings (per_layer_token_embd, 1440 MiB of its 2887 MiB):
-          llama.cpp reads only the rows of the tokens it sees.
+private  = KV cache + recurrent state + compute buffers + prompt cache (cache_ram_mb)
+           + checkpoints + overhead, rounded up to 16 MiB
+overhead = 96 MiB + 5% of the weights (tensor bytes in the file)
+mapped   = the part of the memory-mapped file that will be in RAM:
+           the whole file, minus tensors llama.cpp leaves on disk.
+           Today that is Gemma 3n's Per-Layer Embeddings (per_layer_token_embd, 1440 MiB of its 2887 MiB):
+           llama.cpp reads only the rows of the tokens it sees.
 ```
 
-v0.1 counted the whole file plus the cap and refused Gemma 3n with 4.5 GB free. The estimate is still on the safe side:
+- The prompt cache (`cache_ram_mb`, 256 MB) is counted in full. It fills with use: Qwen3.5-0.8B had 656 MB private after one answer and 849 MB at its peak after the smoke test.
+- Qwen3.5 (`qwen35`): its weights end up in private memory even with mmap and `no_repack`. Measured: working set 714 MB, private 656 MB. So for this architecture the weights count as private, and mapped is 0. The total is the same.
+- A `memory_cap_mb` number below the private estimate replaces it (the child cannot use more).
+- Without GGUF metadata: the cap from the config, the fallback cap (1536 MiB), or 1024 MiB if there is no cap.
+- `load_estimate_mb` (per model or in `[budget]`) still replaces the whole estimate.
 
-| Model | File | v0.1 estimate | v0.2 estimate | Measured working set (private) |
-|---|---|---|---|---|
-| Gemma 3n E2B | 2887 MiB | 4103 MB | **2663 MB** (1216 + 1447) | 1572 MB (370) |
-| Qwen3-4B | 2382 MiB | 3982 MB | 3982 MB (1600 + 2382) | 3029 MB (841) |
-| Qwen3.5-0.8B | 508 MiB | 1596 MB | 1596 MB | 908 MB |
-| Gemma 3 270M router | 241 MiB | 1201 MB | 1201 MB (960 + 241) | 327 MB (138) |
-| all-MiniLM-L6-v2 | 24 MiB | 984 MB | 984 MB (960 + 24) | 37 MB (42) |
+Estimate vs real use, default config (ctx 4096, f16 KV, no repack). "Real" is the child after a 128-token answer ([results/06-low-ram.md](results/06-low-ram.md)). "Peak" is the 0.8B after the whole smoke test (22 Nov 2026), and Qwen3-4B's peak in [results/02-gemma3n.md](results/02-gemma3n.md). MB here means MiB, as in `/stats`.
 
-For small models the fixed 640 MiB overhead in the private part dominates, so the estimate is 3 to 25 times the real use. If you know better, set `load_estimate_mb` per model (for example `load_estimate_mb = 400` for the 270M router).
+| Model | File | v0.2 estimate | v0.3 estimate (private + mapped) | Real working set (private) | v0.3 ÷ real |
+|---|---|---|---|---|---|
+| Gemma 3 270M router | 241 MB | 1265 MB | **705 MB** (464 + 241) | 334 MB (146) | 2.1× |
+| Qwen3.5-0.8B | 508 MB | 1596 MB | **1068 MB** (1068 + 0) | 714 MB (656); peak 909 MB (849) | 1.5×; peak 1.18× |
+| Gemma 3n E2B | 2887 MB | 2663 MB | **2279 MB** (832 + 1447) | 1579 MB (371) | 1.44× |
+| Qwen3-4B | 2382 MB | 3981 MB | **3534 MB** (1152 + 2382) | peak 3077 MB (841) | 1.15× |
+
+- The estimate is above the real working set and the real private bytes for all four. A unit test checks this against the real files.
+- Without the prompt cache the estimate would be 256 MB lower, but then it is below the 0.8B's peak. Set `cache_ram_mb` lower (or 0) to lower both the estimate and the real use.
+- With the default `reserve_free_mb = 1536`, Gemma 3n now needs about 3.7 GB free (v0.2: 4.1 GB). Qwen3-4B needs about 5.0 GB (v0.2: 5.4 GB).
 
 ### `[pacer]`
 
@@ -173,13 +183,15 @@ See [Pacer](#pacer) for how it works.
 | `mode` | `"auto"` | `auto` = level from the signals; `always` = heavy level all the time; `off` = never cap (the signals are still shown in `/stats`). |
 | `poll_ms` | `300` | How often the pacer samples. |
 | `smooth_ms` | `1500` | Other programs' CPU is averaged over this long. |
-| `light_cpu_pct` | `15.0` | Other programs above this share of all logical processors: light level. `0` = never. |
+| `light_cpu_pct` | `20.0` | Other programs above this share of all logical processors: light level. `0` = never. v0.2 default: 15 (an idle PC at 12 to 13% then tended to stay at light). |
 | `heavy_cpu_pct` | `40.0` | Above this: heavy level. `0` = never. |
 | `low_free_mb` | `0` | Free RAM below this: heavy level. `0` = `budget.pressure_free_mb`. |
 | `light_cap_pct` | `75` | Light level: each model may use this share of the CPU it uses at full speed. |
 | `heavy_cap_pct` | `50` | Heavy level. Must not be above `light_cap_pct`. |
 | `hysteresis_pct` | `5.0` | To go down a level, other programs' CPU must be this many points below the threshold (RAM: 256 MB above `low_free_mb`). |
 | `release_after_ms` | `5000` | A level holds at least this long before it may go down. Going up is immediate. (With 2000 the level flapped up to 10 times in 30 s under a light load; see results/05.) |
+| `heavy_hysteresis_pct` | `10.0` | v0.3. To leave heavy, other programs' CPU must be this many points below `heavy_cpu_pct` (so under 30%). |
+| `heavy_release_after_ms` | `10000` | v0.3. Heavy goes down only after CPU (under `heavy_cpu_pct - heavy_hysteresis_pct`) and RAM (256 MB above `low_free_mb`) have stayed clear for this long **in a row**. Any sample above that line restarts the wait. |
 | `busy_priority` | `"unchanged"` | `idle` = also drop the children to idle priority while capped. |
 
 The v0.1 keys `input_active_ms`, `others_cpu_busy_pct` and `busy_cpu_pct` are accepted and ignored (a warning is logged).
@@ -206,7 +218,8 @@ recurrent   = per recurrent layer: (conv_kernel - 1) x (inner_size + 2 x group_c
 compute     = 16 x ubatch x (max feed_forward_length + embedding_length x altup.num_inputs)   (ubatch = 512; ctx_size for embedding models)
 cache_ram   = cache_ram_mb
 checkpoints = ctx_checkpoints x (SWA part of KV + recurrent), only for SWA/hybrid models
-640 MiB     = fixed overhead (tokenizer, server, heap); measured 128 to 517 MiB on the three v0.1 test models
+640 MiB     = fixed overhead (tokenizer, server, heap); measured 128 to 517 MiB on the three v0.1 test models.
+              The cap keeps this large overhead and the prompt cache: it is a hard limit. The load estimate (above) does not.
 ```
 
 bytes(kv type): f16/bf16 2, f32 4, q8_0 34/32, q4_0 18/32, q5_0 22/32, q5_1 24/32. If the metadata cannot be read, the cap falls back to 1536 MiB.
@@ -392,8 +405,9 @@ Everything. Main parts:
                 "cache_ram_mb": 256, "ctx_checkpoints": 4, "pooling": null, "adapters": [ { "id": 0, "path": "..." } ],
                 "active": 0, "unload_pending": false, "idle_secs": 3.1, "last_used_secs_ago": 3.1, "idle_unload_secs": 90,
                 "memory_cap_mb": 1216, "memory_cap_source": "auto",
-                "memory_estimate_mb": { "kv": 64.0, "recurrent": 0.0, "compute": 128.0, "cache_ram": 256.0, "checkpoints": 128.0, "overhead": 640.0, "total": 1216.0, ... },
-                "load_estimate_mb": { "total": 2662.7, "private": 1216.0, "mapped": 1446.7, "repack": 0.0,
+                "memory_estimate_mb": { "kv": 64.0, "recurrent": 0.0, "compute": 128.0, "cache_ram": 256.0, "checkpoints": 128.0, "overhead": 640.0, "total": 1216.0,
+                                        "load_overhead": 240.3, "load_private": 832.0, "weights_private": false, ... },
+                "load_estimate_mb": { "total": 2278.7, "private": 832.0, "mapped": 1446.7, "repack": 0.0,
                                       "on_disk": [ { "tensor": "per_layer_token_embd", "mb": 1440.0 } ], "source": "estimate" },
                 "counters": { "loads": 1, "load_failures": 0, "evictions": 0, "last_load_ms": 3497.9, "generations": 5 },
                 "child": { "pid": 1234, "port": 51234, "loaded_secs": 40.2, "load_ms": 3497.9, "working_set_mb": 1571.7, "private_mb": 369.8,
@@ -405,7 +419,7 @@ Everything. Main parts:
   "budget": { "reserve_free_mb": 1536, "pool_budget_mb": 4500, "pressure_free_mb": 1024, "critical_free_mb": 500, "idle_unload_secs": 90, ... },
   "pacer": { "mode": "auto", "state": "busy", "level": "light", "reason": "other processes use 23% CPU (> 15%)", "capped": true,
              "cap_pct": 75, "cap_pct_of_system": 28.13, "others_cpu_pct": 23.4, "free_mb": 6026, "mem_latency_ns": null,
-             "thresholds": { "light_cpu_pct": 15.0, "heavy_cpu_pct": 40.0, "low_free_mb": 1024, "light_cap_pct": 75, "heavy_cap_pct": 50, ... },
+             "thresholds": { "light_cpu_pct": 20.0, "heavy_cpu_pct": 40.0, "low_free_mb": 1024, "light_cap_pct": 75, "heavy_cap_pct": 50, ... },
              "secs_at_level": { "none": 50.1, "light": 12.3, "heavy": 0.0 }, "level_changes": 2, "capped_secs_total": 12.3, "cap_on_count": 1, "last_error": null,
              "generations_capped": 2, "generations_uncapped": 3, "last_tokens_per_sec_capped": 6.1, "last_tokens_per_sec_uncapped": 7.6 },
   "counters": { "requests_served": 5, "requests_failed": 0, "refused_insufficient_memory": 0, "refused_queue_full": 0, "cancelled": 0,
@@ -467,11 +481,13 @@ They set a **level**, and the level sets a **Job Object CPU rate hard cap** on e
 
 | Level | When | Cap on each model |
 |---|---|---|
-| `none` | other programs ≤ 15% | none |
-| `light` | other programs 15 to 40% | 75% of the CPU the model uses at full speed (3 of 8 threads: 28% of the whole CPU) |
+| `none` | other programs ≤ 20% | none |
+| `light` | other programs 20 to 40% | 75% of the CPU the model uses at full speed (3 of 8 threads: 28% of the whole CPU) |
 | `heavy` | other programs > 40%, or free RAM < `pressure_free_mb` | 50% (18.75% of the whole CPU) |
 
 - **Going up is immediate** (after the 1.5 s average). **Going down** needs the signal below the threshold by `hysteresis_pct` (5 points; RAM: 256 MB) **and** the level held for `release_after_ms` (5 s). So a signal near a threshold does not make the cap flap.
+- **Leaving heavy is slower (v0.3).** CPU must be under 30% (`heavy_hysteresis_pct` = 10 points), RAM must be 256 MB above `low_free_mb`, and both must stay so for `heavy_release_after_ms` (10 s) in a row. In v0.2 the level changed 3 to 9 times per 40 s around the 40% line. In a unit test with noisy CPU around 40% (±8 to ±14 points, 40 s), the v0.2 rules gave 10 to 14 changes and the v0.3 rules 1 or 2.
+- **The reason says when a level is holding (v0.3).** For example `holding: RAM was below 1024 MB, now 1225 MB`, `holding: other processes used over 40% CPU, now 35%`, or `holding heavy for 6 s more; now ...`. v0.2 said "1225 MB RAM free (< 1024 MB)" in this case.
 - The cap is set, changed and removed on the running children, with no restart.
 - **The keyboard and mouse are not a signal any more** (owner decision, v0.2): typing alone does not slow the model; a program that needs the CPU does.
 - Measured (on battery): a light ~20% background load gives the light level about 80% of the time, the model runs at 5.0 to 5.3 instead of 6.1 to 6.9 tok/s; on this laptop the PC's own background is 12 to 13%, close to the 15% line. See [results/05-pacer-v2.md](results/05-pacer-v2.md).
@@ -552,20 +568,20 @@ Adapters are loaded with their model (`adapters = [...]` in the model, plus ever
 - Send `X-Jitmo-Priority: background` for work the user is not waiting for, and your own `X-Jitmo-Request-Id` for anything the user may cancel. On Esc: close the request, or `DELETE /v1/requests/{id}`.
 - For the writer with two inputs: a chain with `{question}` and `{passage}`, or simply a direct chat request with your own prompt.
 - Several models: give each its `[[models]]` entry; pin the small one you always need (the router) so it is never evicted. Set `pool_budget_mb` to your RAM rule.
-- Handle `503 insufficient_memory` (tell the user, or retry later), `503 queue_full` and `502 engine_error` (try again), `499` (your own cancel).
+- Handle `503 insufficient_memory` (tell the user, or retry later), `503 queue_full` and `502 engine_error` (try again), `499` (your own cancel), and `503 memory_pressure` (v0.3: the runtime stopped the generation because RAM stayed short; tell the user, retry later).
 - Expect generation to be slower while other programs use the CPU (pacer levels). `GET /health` → `pacer_capped` and `/stats` → `pacer.level` say so.
 - Expect a model switch to cost a model load if the other model had to be evicted: measured 1.2 s for the 270M router and 1.8 to 2.1 s for Gemma 3n E2B (warm file cache); about 0 if both stay loaded.
 
-## Limits of v0.2
+## Limits of v0.3
 
 - One generation at a time across the pool by default; no batching inside a model (`--parallel 1`).
 - Chain output is not streamed token by token.
 - No authentication. It listens on 127.0.0.1 only by default.
 - Token tagging (NER) and classification heads are not supported (llama.cpp has none). Embeddings are.
 - The pacer has one lever, a CPU cap per child. It cannot change threads per request and does not pause between tokens. Its signals are CPU and free RAM; memory-bandwidth contention is not measured yet.
-- The load estimate is safe but loose for small models (the fixed 640 MiB overhead). Override it with `load_estimate_mb` per model if the pool budget is tight.
+- The load estimate counts the whole prompt cache (`cache_ram_mb`, 256 MB), so for a small model that is used little it is about twice the real use. Override it with `load_estimate_mb` per model, or lower `cache_ram_mb`.
 - The memory cap does not cover memory-mapped weights, and the automatic cap does not cover a repacked copy (`no_repack = false`).
-- Memory pressure waits for a running generation (or chain). A long generation can keep its model loaded while RAM is short, until free RAM falls below `critical_free_mb`.
+- Memory pressure waits for a running generation (or chain) for at most `pressure_finish_max_ms` (15 s), then cancels it. The time limit is tested by unit tests only, not yet in a real low-RAM run.
 - A model that is loading cannot be cancelled; cancelling its request lets the load finish.
 - Windows only (Job Objects, Win32 memory and CPU APIs).
 
@@ -573,4 +589,5 @@ Adapters are loaded with their model (`adapters = [...]` in the model, plus ever
 
 - v0.2 (child mode, cancel, priority, pool switching, embeddings, LoRA, cold load, load estimate): [results/04-v0.2.md](results/04-v0.2.md).
 - Pacer v2: [results/05-pacer-v2.md](results/05-pacer-v2.md).
+- Low free RAM (loading, pacer at 15% vs 20%, memory-pressure unload): [results/06-low-ram.md](results/06-low-ram.md).
 - v0.1: Gemma 3n vs Qwen3-4B [results/02-gemma3n.md](results/02-gemma3n.md); pacer v1 [results/03-pacer-v1.md](results/03-pacer-v1.md); v0 baseline numbers [results/01-baseline.md](results/01-baseline.md).

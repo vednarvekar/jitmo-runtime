@@ -359,7 +359,7 @@ pub async fn run(pool: &Pool, chain: &Chain, run: RunInput<'_>, req: &RequestGua
         let mut body = step.request(&system, &user, model.cfg.chat_template_kwargs.as_ref());
         llama::full_lora(&mut body, model.adapters.len()).map_err(|e| e.with_prefix(&at))?;
         let t0 = Instant::now();
-        let (hold, port, load_ms) = pool.use_model(model).await.map_err(|e| e.with_prefix(&at))?;
+        let (hold, port, load_ms) = pool.use_model(model, Some(&req.token)).await.map_err(|e| e.with_prefix(&at))?;
         let v = llama::chat_once(&pool.http, port, &body).await.map_err(|e| e.with_prefix(&at))?;
         drop(hold);
         model.count_generation();

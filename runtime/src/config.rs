@@ -209,6 +209,10 @@ pub struct BudgetConfig {
     pub pressure_free_mb: u64,
     /// Free RAM below this on one check: unload every model at once, even mid-generation. 0 = never.
     pub critical_free_mb: u64,
+    /// Under memory pressure, a running generation may finish for at most this long. If free RAM
+    /// is still under `pressure_free_mb` then, the generation is cancelled (the client gets a
+    /// `memory_pressure` error) and the model is unloaded. 0 = wait for the generation to end.
+    pub pressure_finish_max_ms: u64,
     /// Unload a model after this many seconds without requests. 0 = never.
     pub idle_unload_secs: u64,
     /// How often the watchdog checks idle time, memory pressure and the children.
@@ -224,6 +228,7 @@ impl Default for BudgetConfig {
             pool_budget_mb: 0,
             pressure_free_mb: 1024,
             critical_free_mb: 500,
+            pressure_finish_max_ms: 15_000,
             idle_unload_secs: 90,
             watch_interval_ms: 1000,
         }
@@ -253,6 +258,11 @@ pub struct PacerConfig {
     pub hysteresis_pct: f64,
     /// A level holds at least this long before it may go down.
     pub release_after_ms: u64,
+    /// To leave heavy, other processes' CPU must be this many points below `heavy_cpu_pct`.
+    pub heavy_hysteresis_pct: f64,
+    /// Heavy goes down only after the signals stayed clear of it (CPU under
+    /// `heavy_cpu_pct - heavy_hysteresis_pct`, RAM fine) this long in a row.
+    pub heavy_release_after_ms: u64,
     /// While capped, also set the children to this priority class: `unchanged` or `idle`.
     pub busy_priority: String,
     /// Pacer v1 keys, accepted and ignored (a warning is logged).
@@ -267,13 +277,15 @@ impl Default for PacerConfig {
             mode: "auto".into(),
             poll_ms: 300,
             smooth_ms: 1500,
-            light_cpu_pct: 15.0,
+            light_cpu_pct: 20.0,
             heavy_cpu_pct: 40.0,
             low_free_mb: 0,
             light_cap_pct: 75,
             heavy_cap_pct: 50,
             hysteresis_pct: 5.0,
             release_after_ms: 5000,
+            heavy_hysteresis_pct: 10.0,
+            heavy_release_after_ms: 10_000,
             busy_priority: "unchanged".into(),
             input_active_ms: None,
             others_cpu_busy_pct: None,
@@ -470,8 +482,8 @@ impl Config {
         if p.heavy_cpu_pct > 0.0 && p.light_cpu_pct > p.heavy_cpu_pct {
             bail!("pacer.light_cpu_pct must not be above pacer.heavy_cpu_pct");
         }
-        if p.hysteresis_pct < 0.0 {
-            bail!("pacer.hysteresis_pct must not be negative");
+        if p.hysteresis_pct < 0.0 || p.heavy_hysteresis_pct < 0.0 {
+            bail!("pacer.hysteresis_pct and pacer.heavy_hysteresis_pct must not be negative");
         }
         if p.poll_ms < 50 {
             bail!("pacer.poll_ms must be at least 50");
@@ -637,7 +649,9 @@ mod tests {
         assert_eq!((cfg.budget.pressure_free_mb, cfg.budget.critical_free_mb), (1024, 500));
         assert_eq!((m.cache_ram_mb, m.ctx_checkpoints), (256, 4));
         assert_eq!(cfg.pacer.mode, "auto");
-        assert_eq!((cfg.pacer.light_cpu_pct, cfg.pacer.heavy_cpu_pct), (15.0, 40.0));
+        assert_eq!((cfg.pacer.light_cpu_pct, cfg.pacer.heavy_cpu_pct), (20.0, 40.0));
+        assert_eq!((cfg.pacer.heavy_hysteresis_pct, cfg.pacer.heavy_release_after_ms), (10.0, 10_000));
+        assert_eq!(cfg.budget.pressure_finish_max_ms, 15_000);
         assert_eq!((cfg.pacer.light_cap_pct, cfg.pacer.heavy_cap_pct, cfg.pacer.smooth_ms), (75, 50, 1500));
         // v1 keys still parse (ignored with a warning).
         assert!(Config::from_toml("[pacer]\ninput_active_ms = 5000\nbusy_cpu_pct = 50\nothers_cpu_busy_pct = 10.0").is_ok());

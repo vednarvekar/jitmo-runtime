@@ -168,6 +168,7 @@ fn model_stats(app: &App, m: &ModelHandle) -> Value {
             "kv": mb(e.kv_bytes), "recurrent": mb(e.recurrent_bytes), "compute": mb(e.compute_bytes),
             "cache_ram": mb(e.cache_ram_bytes), "checkpoints": mb(e.checkpoint_bytes), "overhead": mb(e.overhead_bytes),
             "total": mb(e.total_bytes), "kv_layers": e.kv_layers, "swa_layers": e.swa_layers, "arch": e.arch,
+            "load_overhead": mb(e.load_overhead_bytes), "load_private": mb(e.load_private_bytes), "weights_private": e.weights_private,
         })),
         "load_estimate_mb": {
             "total": mb(l.total_bytes), "private": mb(l.private_bytes), "mapped": mb(l.mapped_bytes), "repack": mb(l.repack_bytes),
@@ -305,7 +306,7 @@ async fn chat_inner(app: &Arc<App>, mut req: Value, model: Option<String>, guard
         let body = GuardedStream {
             inner: Some(Box::pin(resp.into_body().into_data_stream())),
             cancelled,
-            guard: StreamGuard { app: app.clone(), slot: Some(slot), tracker: SseTracker::default(), started, broken: false, cancelled: false, req: Some(guard) },
+            guard: StreamGuard { app: app.clone(), slot: Some(slot), tracker: SseTracker::default(), started, broken: false, cancelled: false, by_runtime: false, req: Some(guard) },
         };
         return Ok(Response::builder()
             .status(status)
@@ -360,8 +361,11 @@ impl Stream for GuardedStream {
         if this.cancelled.as_mut().poll(cx).is_ready() {
             this.inner = None; // closes the connection to llama-server
             this.guard.cancelled = true;
-            let id = this.guard.req.as_ref().map_or("", |r| r.id.as_str());
-            let ev = json!({ "error": { "message": format!("request {id} was cancelled"), "type": "request_cancelled", "code": "request_cancelled" } });
+            let req = this.guard.req.as_ref();
+            let id = req.map_or("", |r| r.id.as_str());
+            let e = req.and_then(|r| r.token.reason()).unwrap_or_else(|| Error::cancelled(format!("request {id} was cancelled")));
+            this.guard.by_runtime = e.code != "request_cancelled";
+            let ev = json!({ "error": { "message": e.message, "type": e.code, "code": e.code } });
             return Poll::Ready(Some(Ok(Bytes::from(format!("data: {ev}\n\ndata: [DONE]\n\n")))));
         }
         let inner = this.inner.as_mut().expect("checked above");
@@ -392,6 +396,8 @@ struct StreamGuard {
     started: Instant,
     broken: bool,
     cancelled: bool,
+    /// Cancelled by the runtime (memory pressure), not by the client.
+    by_runtime: bool,
     req: Option<RequestGuard>,
 }
 
@@ -417,9 +423,14 @@ impl Drop for StreamGuard {
             self.app.pool.stats.record(timing);
             slot.model.count_generation();
         } else if !self.tracker.done {
-            tracing::info!("request {id}: stream ended early ({}); the connection to llama-server is closed", if self.cancelled { "cancelled" } else { "client went away or engine error" });
+            let why = match (self.cancelled, self.by_runtime) {
+                (true, true) => "stopped for memory pressure",
+                (true, false) => "cancelled",
+                _ => "client went away or engine error",
+            };
+            tracing::info!("request {id}: stream ended early ({why}); the connection to llama-server is closed");
         }
-        if self.cancelled {
+        if self.cancelled && !self.by_runtime {
             self.app.pool.stats.cancelled();
         }
         self.app.pool.stats.request_done(complete);
@@ -628,7 +639,7 @@ async fn admin_load(State(app): State<Arc<App>>, body: Bytes) -> Result<Json<Val
     };
     let was_loaded = m.phase() == Phase::Loaded;
     let t0 = Instant::now();
-    let (hold, _port, load_ms) = app.pool.use_model(&m).await?;
+    let (hold, _port, load_ms) = app.pool.use_model(&m, None).await?;
     drop(hold);
     Ok(Json(json!({
         "model": m.name(), "loaded": true, "was_loaded": was_loaded && load_ms == 0.0,

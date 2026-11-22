@@ -13,8 +13,10 @@ RT=/v/Code/jitmo-runtime/runtime/target/release/jitmo-runtime.exe
 REPS=${1:-3}
 shift || true
 CONDS=${*:-"alone off adaptive bgload"}
-P=$OUT/pacer2
+P=${PDIR:-$OUT/pacer2}
 mkdir -p "$P"
+$PY "$B/ramlog.py" "$P/ram.jsonl" 7200 & RAMPID=$!  # free RAM once a second
+trap 'kill $RAMPID 2>/dev/null' EXIT
 
 power() {
   if [ "${ALLOW_BATTERY:-0}" = 1 ]; then
@@ -31,7 +33,7 @@ write_cfg() { # name mode
 [server]
 port = $PORT
 [model]
-path = '$(cygpath -w "$Q4B")'
+path = '$(cygpath -w "${MODEL:-$Q4B}")'
 chat_template_kwargs = { enable_thinking = false }
 log_file = 'rt_$1.llama.log'
 [budget]
@@ -39,6 +41,7 @@ idle_unload_secs = 0
 reserve_free_mb = 512
 [pacer]
 mode = "$2"
+${LIGHT_PCT:+light_cpu_pct = $LIGHT_PCT}
 EOF
 }
 
@@ -91,4 +94,5 @@ for C in $CONDS; do
   kill $RPID 2>/dev/null; wait $RPID 2>/dev/null
   sleep 3
 done
+kill $RAMPID 2>/dev/null
 echo DONE

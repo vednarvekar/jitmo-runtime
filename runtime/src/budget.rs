@@ -16,6 +16,18 @@ const FALLBACK_CAP: u64 = 1536 * MB;
 /// Qwen3-4B 128 MiB, Gemma 3n E2B 180 MiB, Qwen3.5-0.8B 517 MiB. 640 MiB covers all three
 /// with room for the growth seen during generation.
 pub const CAP_OVERHEAD: u64 = 640 * MB;
+/// Fixed part of the load estimate's overhead (tokenizer, server state, heap). The load
+/// estimate is what the free-RAM check uses; unlike the cap it is not a hard limit, so it uses
+/// a smaller overhead. Measured private bytes after a 128-token answer, minus KV, state and
+/// compute buffers (22 Nov 2026): router 270M about 96 MiB, Gemma 3n E2B about 180 MiB,
+/// Qwen3-4B about 128 MiB (21 Nov 2026).
+pub const LOAD_OVERHEAD_BASE: u64 = 96 * MB;
+/// Size-scaled part of the load overhead: this share of the weights (tensor bytes in the file).
+pub const LOAD_OVERHEAD_PCT: u64 = 5;
+/// Architectures whose weights end up in private memory even with mmap and `--no-repack`.
+/// Measured on Qwen3.5-0.8B (22 Nov 2026): working set 714 MB, private 656 MB, so only about
+/// 58 MB of the 507 MB file stayed mapped. Their weights count as private, not mapped.
+pub const PRIVATE_WEIGHTS_ARCHS: &[&str] = &["qwen35"];
 /// llama-server's default physical batch (`-ub`); sliding-window KV is sized to window + this.
 const N_UBATCH: u64 = 512;
 /// Tensors that stay on disk: llama.cpp reads only the rows of the tokens it sees. Gemma 3n's
@@ -59,6 +71,16 @@ pub struct MemoryEstimate {
     pub overhead_bytes: u64,
     /// Sum of all parts, rounded up to 64 MiB: the automatic memory cap.
     pub total_bytes: u64,
+    /// Tensor bytes in the file (the weights).
+    pub weights_bytes: u64,
+    /// Overhead used by the load estimate: `LOAD_OVERHEAD_BASE` + `LOAD_OVERHEAD_PCT` % of the weights.
+    pub load_overhead_bytes: u64,
+    /// Private part of the load estimate: KV + state + compute + prompt cache + checkpoints +
+    /// load overhead, rounded up to 16 MiB. The prompt cache is counted in full: it fills with
+    /// use (Qwen3.5-0.8B: private 656 MB after one answer, 849 MB peak after the smoke test).
+    pub load_private_bytes: u64,
+    /// The weights end up in private memory (`PRIVATE_WEIGHTS_ARCHS`).
+    pub weights_private: bool,
 }
 
 impl MemoryEstimate {
@@ -135,6 +157,12 @@ impl MemoryEstimate {
         est.overhead_bytes = CAP_OVERHEAD;
         let sum = est.kv_bytes + est.recurrent_bytes + est.compute_bytes + est.cache_ram_bytes + est.checkpoint_bytes + est.overhead_bytes;
         est.total_bytes = sum.div_ceil(64 * MB) * 64 * MB;
+
+        est.weights_bytes = g.tensors.iter().map(|t| t.1).sum();
+        est.load_overhead_bytes = LOAD_OVERHEAD_BASE + est.weights_bytes * LOAD_OVERHEAD_PCT / 100;
+        let load = est.kv_bytes + est.recurrent_bytes + est.compute_bytes + est.cache_ram_bytes + est.checkpoint_bytes + est.load_overhead_bytes;
+        est.load_private_bytes = load.div_ceil(16 * MB) * 16 * MB;
+        est.weights_private = PRIVATE_WEIGHTS_ARCHS.contains(&est.arch.as_str());
         Some(est)
     }
 }
@@ -153,10 +181,16 @@ pub struct MemPlan {
 /// RAM the model is expected to take once loaded: what the free-RAM check and the pool budget use.
 ///
 /// `total = private + mapped (+ mapped again without --no-repack)`, where
-/// - `private` = the automatic cap (KV + state + buffers + caches + overhead), or the cap from
-///   the config when one is set, or 1024 MiB if there is neither;
+/// - `private` = KV cache + recurrent state + compute buffers + prompt cache + checkpoints + a
+///   small, size-scaled overhead (`MemoryEstimate::load_private_bytes`). A configured cap smaller
+///   than that is used instead (the child cannot commit more). Without GGUF metadata: the
+///   configured or fallback cap, or 1024 MiB if there is no cap.
 /// - `mapped` = the part of the memory-mapped file expected to be resident: the whole file,
-///   minus tensors llama.cpp leaves on disk (`ON_DISK_TENSORS`).
+///   minus tensors llama.cpp leaves on disk (`ON_DISK_TENSORS`). For `PRIVATE_WEIGHTS_ARCHS`
+///   it is 0 and the same bytes count as private instead.
+///
+/// v0.3: the private part no longer uses the cap's 640 MiB overhead, which made the estimate
+/// 1.7 to 3.8 times the real use (results/06-low-ram.md).
 ///
 /// With repacking on, the CPU backend copies the weights into private memory too, so they
 /// count twice. A number in `load_estimate_mb` replaces the whole estimate.
@@ -212,14 +246,21 @@ impl MemPlan {
             (MemoryCap::Auto, Some(e)) => (Some(e.total_bytes), "auto"),
             (MemoryCap::Auto, None) => (Some(FALLBACK_CAP), "fallback"),
         };
-        let private_bytes = match (source, &estimate) {
-            ("config" | "fallback", _) => cap_bytes.unwrap_or(0),
-            (_, Some(e)) => e.total_bytes,
-            (_, None) => UNCAPPED_PRIVATE,
-        };
         let excluded: u64 = on_disk.iter().map(|(_, n)| n).sum();
-        let mapped_bytes = file_bytes.saturating_sub(excluded);
-        let repack_bytes = if no_repack { 0 } else { mapped_bytes };
+        let file_mapped = file_bytes.saturating_sub(excluded);
+        let (private_bytes, mapped_bytes) = match &estimate {
+            Some(e) => {
+                let (p, mapped) = if e.weights_private { (e.load_private_bytes + file_mapped, 0) } else { (e.load_private_bytes, file_mapped) };
+                let p = match (source, cap_bytes) {
+                    ("config", Some(c)) => p.min(c),
+                    _ => p,
+                };
+                (p, mapped)
+            }
+            None if source == "none" => (UNCAPPED_PRIVATE, file_mapped),
+            None => (cap_bytes.unwrap_or(UNCAPPED_PRIVATE), file_mapped),
+        };
+        let repack_bytes = if no_repack { 0 } else { file_mapped };
         let mut load = LoadEstimate {
             file_bytes,
             private_bytes,
@@ -295,6 +336,12 @@ pub fn memory_action(cfg: &Config, free: u64, low_signal: bool, low_count: u32) 
     MemoryAction::None
 }
 
+/// Under memory pressure, has a running generation had its time? True once it waited
+/// `pressure_finish_max_ms` (0 = no limit) and free RAM is still short.
+pub fn pressure_wait_over(waited: Option<std::time::Duration>, pressure_finish_max_ms: u64, still_low: bool) -> bool {
+    pressure_finish_max_ms > 0 && still_low && waited.is_some_and(|w| w.as_millis() >= pressure_finish_max_ms as u128)
+}
+
 /// True if this check counts toward memory pressure.
 pub fn is_low(cfg: &Config, free: u64, signal: Option<&LowMemorySignal>) -> (bool, bool) {
     let sig = signal.is_some_and(|s| s.is_low());
@@ -363,22 +410,103 @@ mod tests {
 
     #[test]
     fn the_load_estimate_leaves_on_disk_tensors_out() {
-        let e = MemoryEstimate { total_bytes: 1216 * MB, ..Default::default() };
+        let e = MemoryEstimate { total_bytes: 1216 * MB, load_private_bytes: 560 * MB, ..Default::default() };
         // Gemma 3n E2B: 2887 MiB file, 1440 MiB of Per-Layer Embeddings.
         let ple = vec![("per_layer_token_embd".to_string(), 1440 * MB)];
         let p = MemPlan::decide(MemoryCap::Auto, Some(e.clone()), 2887 * MB, ple.clone(), true, 0);
         assert_eq!(p.load.mapped_bytes, 1447 * MB);
-        assert_eq!(p.load_bytes(), (1216 + 1447) * MB, "v0.1 counted 2887 + 1216");
+        assert_eq!(p.load_bytes(), (560 + 1447) * MB, "v0.2 counted the 1216 MiB cap as private");
+        assert_eq!(p.cap_mb(), 1216, "the cap itself is unchanged");
         // Repacking copies the mapped weights into private memory.
         let r = MemPlan::decide(MemoryCap::Auto, Some(e.clone()), 2887 * MB, ple, false, 0);
-        assert_eq!(r.load_bytes(), (1216 + 2 * 1447) * MB);
-        // A configured cap is the private part; no cap and no estimate = 1024 MiB.
+        assert_eq!(r.load_bytes(), (560 + 2 * 1447) * MB);
+        // A configured cap below the estimate bounds the private part; above it, it does not.
+        let c = MemPlan::decide(MemoryCap::Mb(400), Some(e.clone()), 100 * MB, vec![], true, 0);
+        assert_eq!(c.load.private_bytes, 400 * MB);
         let c = MemPlan::decide(MemoryCap::Mb(900), Some(e.clone()), 100 * MB, vec![], true, 0);
+        assert_eq!(c.load.private_bytes, 560 * MB);
+        // No estimate: the configured cap, or 1024 MiB with no cap.
+        let c = MemPlan::decide(MemoryCap::Mb(900), None, 100 * MB, vec![], true, 0);
         assert_eq!(c.load.private_bytes, 900 * MB);
         let n = MemPlan::decide(MemoryCap::Mb(0), None, 100 * MB, vec![], true, 0);
         assert_eq!(n.load_bytes(), 1124 * MB);
+        // Weights that end up private are counted once, as private.
+        let w = MemoryEstimate { weights_private: true, ..e.clone() };
+        let q = MemPlan::decide(MemoryCap::Auto, Some(w), 507 * MB, vec![], true, 0);
+        assert_eq!((q.load.private_bytes, q.load.mapped_bytes, q.load_bytes()), ((560 + 507) * MB, 0, (560 + 507) * MB));
         let o = MemPlan::decide(MemoryCap::Auto, Some(e), 100 * MB, vec![], true, 777);
         assert_eq!((o.load_bytes(), o.load.source), (777 * MB, "config"));
+    }
+
+    /// Real use after a 128-token answer (results/06-low-ram.md, 22 Nov 2026), in MB:
+    /// (file, private, working set). The load estimate must never be below either, and should
+    /// be well under the v0.2 estimate. The estimates are from the GGUF metadata of the real
+    /// files (the test is skipped for a file that is not on this PC).
+    #[test]
+    fn the_load_estimate_covers_the_measured_use() {
+        let m = ModelConfig::default();
+        let dir = std::path::Path::new(r"V:\jitmo-sandbox\models");
+        // (file, real private MB, real working set MB, v0.2 estimate MB, max estimate / working set)
+        // The 0.8B is there twice: after one answer, and its peak after the whole smoke test
+        // (several prompts in the prompt cache, 22 Nov 2026).
+        let cases = [
+            ("gemma-3-270m-it-router-Q4_K_M.gguf", 146.0, 334.0, 1265.0, 2.2),
+            ("Qwen3.5-0.8B-Q4_K_M.gguf", 656.0, 714.0, 1596.0, 1.6),
+            ("Qwen3.5-0.8B-Q4_K_M.gguf", 849.0, 909.0, 1596.0, 1.3),
+            ("gemma-3n-E2B-it-Q4_K_M.gguf", 371.0, 1579.0, 2663.0, 1.5),
+        ];
+        let b = BudgetConfig::default();
+        for (file, private, ws, old, max_ratio) in cases {
+            let path = dir.join(file);
+            if !path.is_file() {
+                eprintln!("skipped: {} not found", path.display());
+                continue;
+            }
+            let p = MemPlan::new(&ModelConfig { path, ..m.clone() }, &b);
+            let total = mib(p.load_bytes());
+            let priv_est = mib(p.load.private_bytes);
+            eprintln!("{file}: load estimate {total:.0} MiB (private {priv_est:.0}), real {ws} / {private} MB, v0.2 {old}");
+            // MiB >= MB, so comparing MiB to MB is on the safe side.
+            assert!(priv_est >= private, "{file}: private estimate {priv_est} < real {private}");
+            assert!(total >= ws, "{file}: estimate {total} < real working set {ws}");
+            assert!(total <= ws * max_ratio, "{file}: estimate {total} is over {max_ratio}x the real {ws}");
+            assert!(total < old * 0.9, "{file}: estimate {total} is not below v0.2's {old}");
+        }
+        // Qwen3-4B still needs about its real amount: peak working set 3077 MB, peak private
+        // 841 MB through the runtime, repack off (results/02-gemma3n.md).
+        let path = dir.join("Qwen3-4B-Instruct-2507-Q4_K_M.gguf");
+        if path.is_file() {
+            let p = MemPlan::new(&ModelConfig { path, ..m }, &b);
+            let total = mib(p.load_bytes());
+            eprintln!("Qwen3-4B: load estimate {total:.0} MiB (private {:.0})", mib(p.load.private_bytes));
+            assert!(total >= 3077.0 && total <= 3077.0 * 1.2, "Qwen3-4B: {total}");
+            assert!(total < 3981.0 * 0.9, "below v0.2's 3981");
+            assert!(mib(p.load.private_bytes) >= 841.0, "Qwen3-4B private: {}", mib(p.load.private_bytes));
+        }
+    }
+
+    /// The load overhead grows with the weights and the formula adds up its parts.
+    #[test]
+    fn the_load_private_part_is_kv_compute_and_a_scaled_overhead() {
+        let m = ModelConfig::default();
+        let kvs = [
+            ("general.architecture", V::Str("qwen3")),
+            ("qwen3.block_count", V::U32(36)),
+            ("qwen3.embedding_length", V::U32(2560)),
+            ("qwen3.feed_forward_length", V::U32(9728)),
+            ("qwen3.attention.head_count", V::U32(32)),
+            ("qwen3.attention.head_count_kv", V::U32(8)),
+        ];
+        let small = Gguf::parse(&mut std::io::Cursor::new(crate::gguf::testfile::build_with_tensors(&kvs, &[("w", MB)]))).unwrap();
+        let big = Gguf::parse(&mut std::io::Cursor::new(crate::gguf::testfile::build_with_tensors(&kvs, &[("w", 21 * MB)]))).unwrap();
+        let (s, b) = (MemoryEstimate::from_gguf(&small, &m).unwrap(), MemoryEstimate::from_gguf(&big, &m).unwrap());
+        assert_eq!((s.weights_bytes, b.weights_bytes), (MB, 21 * MB));
+        assert_eq!(s.load_overhead_bytes, LOAD_OVERHEAD_BASE + MB * LOAD_OVERHEAD_PCT / 100);
+        assert!(b.load_overhead_bytes > s.load_overhead_bytes + MB / 2, "grows with the weights");
+        let parts = s.kv_bytes + s.recurrent_bytes + s.compute_bytes + s.cache_ram_bytes + s.checkpoint_bytes + s.load_overhead_bytes;
+        assert!(s.load_private_bytes >= parts && s.load_private_bytes < parts + 16 * MB);
+        assert!(s.load_private_bytes < s.total_bytes, "no 640 MiB overhead");
+        assert!(!s.weights_private);
     }
 
     /// The KV and recurrent sizes must match what llama.cpp build 12248 printed for the real
@@ -503,5 +631,19 @@ mod tests {
         let mut off = Config::default();
         off.budget.critical_free_mb = 0;
         assert!(matches!(memory_action(&off, 10 * MB, false, 2), MemoryAction::UnloadWhenFree(_)));
+    }
+
+    #[test]
+    fn finish_then_unload_has_a_time_limit() {
+        use std::time::Duration;
+        let max = Config::default().budget.pressure_finish_max_ms;
+        assert_eq!(max, 15_000);
+        let s = |n| Some(Duration::from_secs(n));
+        assert!(!pressure_wait_over(s(14), max, true), "still within the limit");
+        assert!(pressure_wait_over(s(15), max, true));
+        assert!(pressure_wait_over(s(43), max, true), "results/06-low-ram.md: it waited 43 s");
+        assert!(!pressure_wait_over(s(43), max, false), "RAM came back: let the generation finish");
+        assert!(!pressure_wait_over(s(600), 0, true), "0 = no limit (v0.2)");
+        assert!(!pressure_wait_over(None, max, true), "no pressure wait in progress");
     }
 }

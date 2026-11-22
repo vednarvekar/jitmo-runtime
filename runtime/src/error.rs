@@ -44,6 +44,11 @@ impl Error {
     pub fn cancelled(m: impl Into<String>) -> Error {
         Error::new(499, "request_cancelled", m)
     }
+    /// The runtime stopped the generation to unload its model: free RAM stayed short for
+    /// longer than `budget.pressure_finish_max_ms`.
+    pub fn memory_pressure(m: impl Into<String>) -> Error {
+        Error::new(503, "memory_pressure", m)
+    }
     pub fn request_not_found(m: impl Into<String>) -> Error {
         Error::new(404, "request_not_found", m)
     }

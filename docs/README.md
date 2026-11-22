@@ -12,6 +12,7 @@ Repo: https://github.com/vednarvekar/jitmo-runtime · owner: Ved Narvekar · sta
 | [04 Plan](04-plan.md) | How we move forward: steps, setup, tracking |
 | [05 OpenJarvis Study](05-openjarvis-study.md) | How OpenJarvis works, where it beats us, what we can reuse |
 | [06 Runtime API](06-runtime-api.md) | Runtime v0 for the jitmo agent team: how to start it, config, every endpoint, chains, limits, measured numbers |
+| [07 Roadmap](07-roadmap.md) | Steps from v0.2 to a ready runtime (v1.0), and what comes after |
 | [results/](results/) | Measured numbers from the owner's laptop |
 
 ## Rules for these docs

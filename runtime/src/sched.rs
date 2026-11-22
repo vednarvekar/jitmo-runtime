@@ -38,6 +38,9 @@ impl Priority {
 struct CancelInner {
     flag: AtomicBool,
     notify: Notify,
+    /// Set when the runtime (not the client) cancels: the error the client gets instead of
+    /// `request_cancelled`.
+    reason: std::sync::Mutex<Option<Error>>,
 }
 
 #[derive(Clone, Default)]
@@ -47,6 +50,17 @@ impl CancelToken {
     pub fn cancel(&self) {
         self.0.flag.store(true, Ordering::SeqCst);
         self.0.notify.notify_waiters();
+    }
+    /// Cancel with the error the client should get (the runtime stops the request).
+    pub fn cancel_with(&self, e: Error) {
+        let mut r = self.0.reason.lock().unwrap_or_else(|p| p.into_inner());
+        r.get_or_insert(e);
+        drop(r);
+        self.cancel();
+    }
+    /// The error set by `cancel_with`, if any.
+    pub fn reason(&self) -> Option<Error> {
+        self.0.reason.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
     pub fn is_cancelled(&self) -> bool {
         self.0.flag.load(Ordering::SeqCst)
@@ -321,7 +335,7 @@ impl Requests {
 pub async fn cancellable<T>(token: &CancelToken, id: &str, work: impl std::future::Future<Output = Result<T, Error>>) -> Result<T, Error> {
     tokio::select! {
         biased;
-        _ = token.cancelled() => Err(Error::cancelled(format!("request {id} was cancelled"))),
+        _ = token.cancelled() => Err(token.reason().unwrap_or_else(|| Error::cancelled(format!("request {id} was cancelled")))),
         r = work => r,
     }
 }
@@ -410,5 +424,20 @@ mod tests {
         assert_eq!(reqs.cancel("bar-42"), None);
         assert_eq!(Priority::parse(" Background "), Some(Priority::Background));
         assert_eq!(Priority::parse("urgent"), None);
+    }
+
+    #[tokio::test]
+    async fn a_runtime_cancel_gives_its_own_error() {
+        let t = CancelToken::default();
+        t.cancel_with(Error::memory_pressure("free RAM stayed low"));
+        t.cancel_with(Error::cancelled("later cancels do not replace the first reason"));
+        let r: Result<(), Error> = cancellable(&t, "x", std::future::pending()).await;
+        let e = r.unwrap_err();
+        assert_eq!((e.status, e.code, e.message.as_str()), (503, "memory_pressure", "free RAM stayed low"));
+        let plain = CancelToken::default();
+        plain.cancel();
+        assert!(plain.reason().is_none());
+        let r: Result<(), Error> = cancellable(&plain, "y", std::future::pending()).await;
+        assert_eq!(r.unwrap_err().code, "request_cancelled");
     }
 }

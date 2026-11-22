@@ -1,11 +1,12 @@
-# Smoke test for jitmo-runtime v0.2 (Windows PowerShell 5.1+).
+# Smoke test for jitmo-runtime v0.3 (Windows PowerShell 5.1+).
 # Starts the runtime with a small model, calls every endpoint, checks the llama-server child
 # goes away on /admin/unload and when the runtime is killed. Part 2 checks the v0.1 rules:
 # memory pressure lets a running generation finish, critical memory aborts it, the pacer caps
 # the child. Part 3 checks v0.2: child-process mode (port 0, --port-file, --parent-pid),
 # /admin/load, request ids, cancel (running, queued, client closes a stream), priority, chain
 # vars over two models with pool eviction, embeddings and LoRA (skipped if the 270M router,
-# all-MiniLM-L6-v2 or the synthetic adapter are not on disk). Exit code 0 = all checks passed.
+# all-MiniLM-L6-v2 or the synthetic adapter are not on disk). v0.3: pressure_finish_max_ms stops a
+# generation that runs too long under pressure (503 memory_pressure). Exit code 0 = all checks passed.
 #
 #   powershell -ExecutionPolicy Bypass -File runtime\scripts\smoke.ps1 [-Model <gguf>] [-Port 8090]
 param(
@@ -167,7 +168,7 @@ $long = @{ model = 'jitmo-base'; max_tokens = 400; temperature = 0; ignore_eos =
 
 # 11. Pressure during a generation: it finishes, then the model is unloaded.
 #     (Pressure is simulated with a floor above the free RAM; critical is off.)
-$p = Start-Rt 'pressure' "pressure_free_mb = 60000`ncritical_free_mb = 0`nreserve_free_mb = 0`nwatch_interval_ms = 300"
+$p = Start-Rt 'pressure' "pressure_free_mb = 60000`ncritical_free_mb = 0`nreserve_free_mb = 0`nwatch_interval_ms = 300`npressure_finish_max_ms = 0"
 try {
     $job = Start-Job -ScriptBlock { param($u, $b) Invoke-WebRequest -UseBasicParsing -Method Post -Uri $u -Body $b -ContentType 'application/json' -TimeoutSec 600 } `
         -ArgumentList "$base/v1/chat/completions", ($long | ConvertTo-Json -Depth 5 -Compress)
@@ -183,6 +184,22 @@ try {
     $st = Get-Json '/stats'
     Check 'pressure: unloaded after the generation' (($st.model_state -eq 'unloaded') -and ($st.counters.unloads.memory_pressure -ge 1)) `
         ("state={0} unloads={1}" -f $st.model_state, ($st.counters.unloads | ConvertTo-Json -Compress))
+} finally { Stop-Rt $p }
+
+# 11b. Pressure with a time limit (v0.3): after pressure_finish_max_ms the generation is stopped
+#     with 503 memory_pressure, and the model is unloaded.
+$p = Start-Rt 'pressure_limit' "pressure_free_mb = 60000`ncritical_free_mb = 0`nreserve_free_mb = 0`nwatch_interval_ms = 300`npressure_finish_max_ms = 2000"
+try {
+    $code = 0; $body = ''
+    $t0 = Get-Date
+    try { Post '/v1/chat/completions' $long | Out-Null; $code = 200 } catch {
+        if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode; $body = "$($_.ErrorDetails.Message)" } else { $code = -1 } }
+    $secs = ((Get-Date) - $t0).TotalSeconds
+    Start-Sleep -Milliseconds 800
+    $st = Get-Json '/stats'
+    Check 'pressure limit: generation stopped with 503 memory_pressure, model unloaded' `
+        (($code -eq 503) -and ($body -match 'memory_pressure') -and ($st.model_state -eq 'unloaded') -and ($st.counters.unloads.memory_pressure -ge 1)) `
+        ("status={0} after {1:N1} s state={2} body={3}" -f $code, $secs, $st.model_state, $body)
 } finally { Stop-Rt $p }
 
 # 12. Critical memory: the running generation is aborted at once.
@@ -249,7 +266,7 @@ port = 0
 [budget]
 idle_unload_secs = 0
 reserve_free_mb = 512
-pool_budget_mb = 2000
+pool_budget_mb = 1500      # v0.3 estimates: chat 1068 + router 705 > 1500, so a step on the other model evicts
 [pacer]
 mode = "off"
 [[models]]

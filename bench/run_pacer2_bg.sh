@@ -9,6 +9,8 @@ RT=/v/Code/jitmo-runtime/runtime/target/release/jitmo-runtime.exe
 REPS=${1:-3}
 P=${PDIR:-$OUT/pacer2}
 mkdir -p "$P"
+$PY "$B/ramlog.py" "$P/ram.jsonl" 7200 & RAMPID=$!  # free RAM once a second
+trap 'kill $RAMPID 2>/dev/null' EXIT
 s=$(powershell -NoProfile -c "Add-Type -AssemblyName System.Windows.Forms; \$p=[System.Windows.Forms.SystemInformation]::PowerStatus; '{0} {1}' -f \$p.PowerLineStatus, \$p.BatteryLifePercent" | tr -d '\r')
 echo "$(date '+%F %T') power: $s (pacer2 bgonly)" | tee -a "$OUT/power.log"
 case "$s" in Online*) ;; *) [ "${ALLOW_BATTERY:-0}" = 1 ] || { echo "not on AC"; exit 9; } ;; esac
@@ -17,12 +19,15 @@ cat > "$P/rt_bgonly.toml" <<EOF
 [server]
 port = $PORT
 [model]
-path = '$(cygpath -w "$Q4B")'
+path = '$(cygpath -w "${MODEL:-$Q4B}")'
 chat_template_kwargs = { enable_thinking = false }
 log_file = 'rt_bgonly.llama.log'
 [budget]
 idle_unload_secs = 0
 reserve_free_mb = 512
+[pacer]
+mode = "${PACER_MODE:-auto}"
+${LIGHT_PCT:+light_cpu_pct = $LIGHT_PCT}
 EOF
 "$RT" --config "$(cygpath -w "$P/rt_bgonly.toml")" > "$P/rt_bgonly.out.log" 2>&1 &
 RPID=$!
@@ -37,7 +42,7 @@ sample() { # out secs
 }
 
 for r in $(seq 1 $REPS); do
-  for load in noload bg; do
+  for load in ${LOADS:-noload bg}; do
     tag=bgonly_${load}_r$r
     rm -f "$P/${tag}_pacer.jsonl"
     $PY "$B/stream_client.py" --chat --port $PORT --n 1500 --out "$P/${tag}_tokens.json" > "$P/${tag}_client.txt" 2>&1 &
@@ -45,9 +50,10 @@ for r in $(seq 1 $REPS); do
     sleep 5
     BG=
     if [ $load = bg ]; then $PY "$B/bgload.py" 2 0.8 30 & BG=$!; fi
+    if [ $load = heavy ]; then $PY "$B/bgload.py" 4 0.9 30 & BG=$!; fi  # about 45% of the CPU
     sleep 4  # let the 1.5 s average and the level settle
     T0=$(date +%s%3N)
-    sample "$P/${tag}_pacer.jsonl" 20
+    sample "$P/${tag}_pacer.jsonl" ${SAMPLES:-20}
     T1=$(date +%s%3N)
     kill $CPID 2>/dev/null; wait $CPID 2>/dev/null
     [ -n "$BG" ] && wait $BG 2>/dev/null
@@ -57,4 +63,5 @@ for r in $(seq 1 $REPS); do
 done
 kill $RPID 2>/dev/null; wait $RPID 2>/dev/null
 $PY "$B/summarize_pacer2_bg.py" "$P"
+kill $RAMPID 2>/dev/null
 echo DONE
