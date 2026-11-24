@@ -388,10 +388,20 @@ def main():
     ap.add_argument("--no-schema", action="store_true", help="drop response_format json_schema (JSON from the prompt alone)")
     ap.add_argument("--no-template-kwargs", action="store_true", help="do not send chat_template_kwargs enable_thinking=false")
     ap.add_argument("--no-warmup", action="store_true", help="skip POST /admin/load before the run")
+    ap.add_argument("--resume", metavar="RUN.jsonl",
+                    help="keep the answered items of an earlier run of the same model; rerun only the ones that got a request error")
+    ap.add_argument("--max-errors", type=int, default=3,
+                    help="stop after this many request errors in a row (model unloaded for memory, runtime gone)")
     ap.add_argument("--dry-run", action="store_true", help="print the request bodies, send nothing")
     ap.add_argument("--self-test", action="store_true", help="score each item's reference answer; no server")
     ap.add_argument("--compare", nargs="+", metavar="RUN.jsonl", help="compare finished runs; no server")
     args = ap.parse_args()
+    # Windows consoles default to cp1252, which cannot print Devanagari answers.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
 
     if args.compare:
         print(compare(args.compare))
@@ -415,7 +425,19 @@ def main():
     jpath = os.path.join(args.out, "{}-{}.jsonl".format(safe, stamp))
     mpath = os.path.join(args.out, "{}-{}.md".format(safe, stamp))
     flags = {k: getattr(args, k) for k in ("no_grammar", "no_schema", "no_template_kwargs")}
+    kept = {}
+    if args.resume:
+        with open(args.resume, encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    old = json.loads(line)
+                    if not old.get("error"):
+                        kept[old["id"]] = old
+        print("resume: keeping {} answered items from {}".format(len(kept), args.resume), flush=True)
+    order = [it["id"] for it in items]
+    items = [it for it in items if it["id"] not in kept]
     records = []
+    errors_in_row = 0
     t_start = time.perf_counter()
     with open(jpath, "w", encoding="utf-8", newline="\n") as out:
         for n, it in enumerate(items, 1):
@@ -453,11 +475,18 @@ def main():
             rec["check_share"] = sum(c["ok"] for c in checks) / len(checks)
             rec["pass"] = all(c["ok"] for c in checks)
             records.append(rec)
-            out.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            out.flush()
             print("[{:3d}/{}] {:14s} {:4s} {:>7s} ms  {}".format(
                 n, len(items), it["id"], "ok" if rec["pass"] else "FAIL", fmt(ms),
                 (text or rec.get("error", "")).replace("\n", " ")[:70]), flush=True)
+            errors_in_row = errors_in_row + 1 if rec.get("error") else 0
+            if errors_in_row >= args.max_errors:
+                print("stopping: {} request errors in a row; rerun with --resume {}".format(errors_in_row, jpath), flush=True)
+                break
+        by_id = dict(kept)
+        by_id.update({r["id"]: r for r in records})
+        records = [by_id[i] for i in order if i in by_id]
+        for rec in records:
+            out.write(json.dumps(rec, ensure_ascii=False) + "\n")
     wall = time.perf_counter() - t_start
     title = "{} ({} items, {:.0f} s, warm-up load {} ms, flags {})".format(
         args.model, len(records), wall, fmt(load_ms), ", ".join(k for k, v in flags.items() if v) or "none")
