@@ -7,6 +7,7 @@ description = "Local model runtime v0: one llama-server child under a RAM budget
 
 [dependencies]
 anyhow = "1"
+libloading = "0.8"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }

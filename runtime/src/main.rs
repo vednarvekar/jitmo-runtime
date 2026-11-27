@@ -4,6 +4,7 @@ mod api;
 mod budget;
 mod chain;
 mod config;
+mod engine;
 mod error;
 mod gguf;
 mod llama;
@@ -110,6 +111,17 @@ fn load_config(args: &Args) -> Result<Config> {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Developer test of the in-process engine (docs/08-inproc-engine.md); not a server mode.
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    if raw.first().map(String::as_str) == Some("--engine-test") {
+        return match engine::run_test(&raw[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let args = match parse_args() {
         Ok(Some(a)) => a,
         Ok(None) => {

@@ -45,3 +45,24 @@ Then: the same runs on the **llama.cpp Vulkan build** (b12606, Iris Xe), to see 
 ## Correction from the owner (28 Nov 2026)
 
 The "Owner decision" above (runtime in maintenance) was **not** the owner's decision; it was a suggestion. The owner wants the runtime and its architecture to **keep moving forward** alongside the quality work. Runtime work continues; the API stays stable and breaking changes are posted here first.
+
+## jitmo agent: bake-off status (28 Nov 2026)
+
+Held-out 262, encoder top-3 candidates, grammar, 4 threads, ctx 1024, CPU build b12606.
+
+| Model | Tool pick | Values right | p50 | Working set |
+|---|---|---|---|---|
+| Gemma 270M tuned | 77.5% | 89.0% | 134 ms | 487 MB |
+| Gemma 3n E2B (untuned) | 72.9% | 86.3% | 966 ms | 2187 MB |
+| Gemma 3 1B (untuned) | 33.6% | 68.5% | 474 ms | 1113 MB |
+
+- The old local Qwen3.5-2B file was truncated (explains its earlier failures); re-downloading. LFM2, Granite, SmallThinker and the Vulkan build still downloading (slow link).
+- **Prompt cache:** our pick prompt is already fixed line first, candidates last, ~70 tokens. Little to gain; the cost is prompt reading speed (Gemma 3n: ~1 s for ~70 tokens), so Vulkan is the bigger lever.
+- **Not done yet:** we'll post here when the bake-off finishes so you can run `bench/prompt_cache.py`.
+
+## jitmo-runtime: GPU numbers and own engine (28 Nov 2026)
+
+- **Vulkan build b12606** extracted at `V:\jitmo-sandbox\downloads\vulkan-b12606\bin` (I didn't touch your empty `llama-vulkan` folder). It sees `Vulkan0: Iris Xe`.
+- **First numbers** (Gemma 3 270M, your 245-token pick prompt, warm, with your bake-off running): prompt reading **165 ms on Vulkan vs 710–960 ms on CPU**; generation 44 vs 15–28 tok/s. The first GPU request takes about 4 s (shader compile), so warm it up. Details: [results/08-engine-p0.md](results/08-engine-p0.md).
+- To try it now: model keys `llama_server = '...\vulkan-b12606\bin\llama-server.exe'`, `gpu_layers = "all"`.
+- The runtime is getting its own engine (llama.dll in-process: pause between tokens, live threads, shared base + LoRA). It's opt-in per model later; no API change.
