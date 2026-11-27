@@ -37,11 +37,23 @@ pub struct ServerConfig {
     /// Generations that may run at the same time across all models. The models share the
     /// memory bandwidth, so 1 is the default.
     pub max_concurrent: usize,
+    /// Web page origins (exact `Origin` header values) allowed to call the API. Empty = none.
+    pub allowed_origins: Vec<String>,
+    /// A waiting interactive request stops a running background generation (which gets
+    /// `503 preempted` and may retry).
+    pub preempt_background: bool,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
-        ServerConfig { host: "127.0.0.1".into(), port: 8090, max_queue: 8, max_concurrent: 1 }
+        ServerConfig {
+            host: "127.0.0.1".into(),
+            port: 8090,
+            max_queue: 8,
+            max_concurrent: 1,
+            allowed_origins: Vec::new(),
+            preempt_background: true,
+        }
     }
 }
 
@@ -265,6 +277,8 @@ pub struct PacerConfig {
     pub heavy_release_after_ms: u64,
     /// While capped, also set the children to this priority class: `unchanged` or `idle`.
     pub busy_priority: String,
+    /// Leave the `--parent-pid` process and its other descendants out of "other programs' CPU".
+    pub exclude_client_cpu: bool,
     /// Pacer v1 keys, accepted and ignored (a warning is logged).
     pub input_active_ms: Option<u64>,
     pub others_cpu_busy_pct: Option<f64>,
@@ -287,6 +301,7 @@ impl Default for PacerConfig {
             heavy_hysteresis_pct: 10.0,
             heavy_release_after_ms: 10_000,
             busy_priority: "unchanged".into(),
+            exclude_client_cpu: true,
             input_active_ms: None,
             others_cpu_busy_pct: None,
             busy_cpu_pct: None,

@@ -264,7 +264,7 @@ impl Pool {
         let low_priority = cfg.models.iter().all(|m| m.low_priority);
         Arc::new(Pool {
             pacer: Pacer::new(cfg.pacer.clone(), budget::logical_processors(), low_priority, cfg.budget.pressure_free_mb),
-            sched: Scheduler::new(cfg.server.max_concurrent, cfg.server.max_queue),
+            sched: Scheduler::new(cfg.server.max_concurrent, cfg.server.max_queue, cfg.server.preempt_background),
             requests: Requests::new(),
             http: llama::client(),
             models,
@@ -320,7 +320,7 @@ impl Pool {
     /// Wait for a generation slot (priority queue), then make sure the model is loaded.
     pub async fn acquire(&self, m: &Arc<ModelHandle>, req: &RequestGuard) -> Result<Slot, Error> {
         let t0 = Instant::now();
-        let permit = match self.sched.acquire(req.priority).await {
+        let permit = match self.sched.acquire(req.priority, Some(req.token.clone())).await {
             Ok(p) => p,
             Err(e) => {
                 if e.code == "queue_full" {

@@ -205,6 +205,9 @@ async fn run(args: Args) -> Result<()> {
         cfg.pacer.mode,
         if chains.is_empty() { "none".to_string() } else { chains.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ") }
     );
+    if let Some((pid, _)) = &parent {
+        pool.pacer.set_client(*pid);
+    }
     pool.spawn_watchdog();
     pool.spawn_pacer();
 

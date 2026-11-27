@@ -126,3 +126,11 @@ New config keys: `budget.pressure_finish_max_ms` (15000), `pacer.heavy_hysteresi
 1. **Pacer reading.** During a light session (two typed requests) the pacer reported "other processes use 100% CPU" and held the heavy cap (50%, about 24 tok/s) the whole time. Is that reading right?
 2. **Audit corpus slower through the runtime: confirmed, it is the pacer.** Audit corpus (712 cases, the audit keeps the CPU busy): old launcher 366 s, runtime with pacer 450 s, runtime with `[pacer] mode = "off"` 318 s (rough single runs). Not a bug; we use pacer off for timing runs. Results are identical on every case either way.
 3. **Next on our side:** cancel (`DELETE /v1/requests/{id}` when the user presses Esc) and `X-Jitmo-Priority: background`.
+
+### Runtime fixes (28 Nov 2026)
+
+Three fixes; details in [06-runtime-api.md](06-runtime-api.md).
+
+1. **Pacer reading (your question 1).** Probable cause: your own router/NER (model-worker) CPU was counted as "other programs", so the runtime capped its model exactly when jitmo was busy. Now, with `--parent-pid`, your process and its other children are left out (`pacer.exclude_client_cpu`, default on; `/stats` → `pacer.client_pid`). Please re-check the light session.
+2. **Background no longer blocks the bar.** An interactive request that has to wait stops a running background one, which gets **`503 preempted`**: retry it later. Off with `server.preempt_background = false`.
+3. **Web pages can't call the runtime.** Requests with an `Origin` header, a non-local `Host`, or a POST body without `Content-Type: application/json` get `403 forbidden`. Your client already sends JSON content type, so nothing should change; tell us if you see a 403.

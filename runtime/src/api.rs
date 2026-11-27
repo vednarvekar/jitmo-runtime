@@ -76,7 +76,63 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/requests/{id}", delete(cancel_request))
         .route("/admin/load", post(admin_load))
         .route("/admin/unload", post(admin_unload))
+        .layer(axum::middleware::from_fn_with_state(app.clone(), local_only))
         .with_state(app)
+}
+
+// ---------- local-only guard ----------
+//
+// The API has no login, so it must not be reachable from web pages the user visits:
+// - A page can send a "simple" cross-site POST (text/plain body, no preflight). Browsers add
+//   `Origin` to every cross-site POST/DELETE, so a request with an `Origin` is refused unless
+//   `server.allowed_origins` lists it.
+// - DNS rebinding (attacker.com resolving to 127.0.0.1) can also read responses. Its `Host` is
+//   the attacker's name, so only loopback names (and `server.host`) are accepted.
+// - A POST with a body must say `Content-Type: application/json`.
+
+fn host_name(host: &str) -> &str {
+    if let Some(rest) = host.strip_prefix('[') {
+        // [::1]:8090
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    host.rsplit_once(':').map_or(host, |(h, port)| if port.chars().all(|c| c.is_ascii_digit()) { h } else { host })
+}
+
+/// Why a request is refused, or None if it may pass.
+pub fn local_only_check(cfg: &Config, headers: &HeaderMap, method: &axum::http::Method, has_body: bool) -> Option<String> {
+    if let Some(h) = headers.get(header::HOST) {
+        let h = h.to_str().unwrap_or("");
+        let name = host_name(h).to_ascii_lowercase();
+        let ok = ["127.0.0.1", "localhost", "::1"].contains(&name.as_str()) || name == cfg.server.host.to_ascii_lowercase();
+        if !ok {
+            return Some(format!("Host '{h}' is not this machine; the runtime only accepts local requests"));
+        }
+    }
+    if let Some(o) = headers.get(header::ORIGIN) {
+        let o = o.to_str().unwrap_or("");
+        if !cfg.server.allowed_origins.iter().any(|a| a == o) {
+            return Some(format!("requests from web pages are refused (Origin '{o}'); list it in server.allowed_origins to allow it"));
+        }
+    }
+    if *method == axum::http::Method::POST && has_body {
+        let ct = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+        if !ct.trim().to_ascii_lowercase().starts_with("application/json") {
+            return Some("POST bodies must be sent with Content-Type: application/json".into());
+        }
+    }
+    None
+}
+
+async fn local_only(State(app): State<Arc<App>>, req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    use axum::body::HttpBody;
+    let has_body = req.body().size_hint().upper() != Some(0);
+    match local_only_check(&app.cfg, req.headers(), req.method(), has_body) {
+        None => next.run(req).await,
+        Some(why) => {
+            tracing::warn!("refused {} {}: {why}", req.method(), req.uri().path());
+            Error::forbidden(why).into_response()
+        }
+    }
 }
 
 impl IntoResponse for Error {
@@ -196,7 +252,8 @@ async fn stats(State(app): State<Arc<App>>) -> Json<Value> {
         },
         "queue": { "generating": sched.running > 0, "running": sched.running, "waiting": sched.waiting,
                    "waiting_interactive": sched.waiting_interactive, "waiting_background": sched.waiting_background,
-                   "max_concurrent": sched.max_concurrent, "max_queue": sched.max_queue },
+                   "max_concurrent": sched.max_concurrent, "max_queue": sched.max_queue,
+                   "preempt_background": sched.preempt_background, "preempted_total": sched.preempted_total },
         "requests": pool.requests.list(),
         "system": {
             "total_mb": sys.map(|m| mb(m.total)),
@@ -671,3 +728,50 @@ async fn admin_unload(State(app): State<Arc<App>>, Query(q): Query<UnloadQuery>)
     Ok(Json(json!({ "unloaded": !unloaded.is_empty(), "models": unloaded, "model_state": app.pool.default_model().phase().as_str() })))
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::Method;
+
+    fn h(pairs: &[(header::HeaderName, &str)]) -> HeaderMap {
+        let mut m = HeaderMap::new();
+        for (k, v) in pairs {
+            m.insert(k.clone(), HeaderValue::from_str(v).unwrap());
+        }
+        m
+    }
+
+    #[test]
+    fn local_only_refuses_web_pages_foreign_hosts_and_non_json_bodies() {
+        let mut cfg = Config::default();
+        let json = (header::CONTENT_TYPE, "application/json");
+        // jitmo, curl, scripts: loopback Host, no Origin, JSON body.
+        for host in ["127.0.0.1:8090", "localhost:8090", "[::1]:8090", "127.0.0.1"] {
+            assert_eq!(local_only_check(&cfg, &h(&[(header::HOST, host), json.clone()]), &Method::POST, true), None, "{host}");
+        }
+        assert_eq!(local_only_check(&cfg, &HeaderMap::new(), &Method::GET, false), None, "no Host (HTTP/1.0)");
+        // DNS rebinding.
+        assert!(local_only_check(&cfg, &h(&[(header::HOST, "evil.example:8090"), json.clone()]), &Method::POST, true).is_some());
+        // A web page's simple POST: Origin set, text/plain body.
+        let page = h(&[(header::HOST, "127.0.0.1:8090"), (header::ORIGIN, "https://evil.example"), (header::CONTENT_TYPE, "text/plain")]);
+        assert!(local_only_check(&cfg, &page, &Method::POST, true).unwrap().contains("web pages"));
+        // A page's body-less POST (/admin/unload) is refused by its Origin too.
+        let empty = h(&[(header::HOST, "127.0.0.1:8090"), (header::ORIGIN, "null")]);
+        assert!(local_only_check(&cfg, &empty, &Method::POST, false).is_some());
+        // Non-JSON body without an Origin.
+        assert!(local_only_check(&cfg, &h(&[(header::CONTENT_TYPE, "text/plain")]), &Method::POST, true).unwrap().contains("Content-Type"));
+        assert_eq!(local_only_check(&cfg, &HeaderMap::new(), &Method::POST, false), None, "POST with no body");
+        // An allowed origin passes.
+        cfg.server.allowed_origins = vec!["http://localhost:5173".into()];
+        let dev = h(&[(header::ORIGIN, "http://localhost:5173"), json]);
+        assert_eq!(local_only_check(&cfg, &dev, &Method::POST, true), None);
+    }
+
+    #[test]
+    fn host_name_strips_the_port() {
+        assert_eq!(host_name("127.0.0.1:8090"), "127.0.0.1");
+        assert_eq!(host_name("[::1]:8090"), "::1");
+        assert_eq!(host_name("localhost"), "localhost");
+    }
+}

@@ -63,6 +63,8 @@ One TOML file. Every key is optional. Relative paths are relative to the config 
 | `port` | `8090` | Port of the API. `0` = any free port (see above). |
 | `max_queue` | `8` | Requests that may wait for a generation slot. More get `503 queue_full`. |
 | `max_concurrent` | `1` | Generations that may run at the same time, across all models. Keep 1 on a laptop: the models share the RAM bandwidth. More than 1 is meant for different models; two requests to the same model still run one after the other inside its llama-server. |
+| `allowed_origins` | `[]` | 28 Nov. Web page origins (exact `Origin` values, for example `"http://localhost:5173"`) allowed to call the API. See [Local-only guard](#local-only-guard). |
+| `preempt_background` | `true` | 28 Nov. When an interactive request has to wait and no interactive request is running, the newest running background request is stopped with `503 preempted`. `false` = v0.3 behaviour (a running request is never interrupted). |
 
 ### Models: `[model]` or `[[models]]`
 
@@ -193,6 +195,7 @@ See [Pacer](#pacer) for how it works.
 | `heavy_hysteresis_pct` | `10.0` | v0.3. To leave heavy, other programs' CPU must be this many points below `heavy_cpu_pct` (so under 30%). |
 | `heavy_release_after_ms` | `10000` | v0.3. Heavy goes down only after CPU (under `heavy_cpu_pct - heavy_hysteresis_pct`) and RAM (256 MB above `low_free_mb`) have stayed clear for this long **in a row**. Any sample above that line restarts the wait. |
 | `busy_priority` | `"unchanged"` | `idle` = also drop the children to idle priority while capped. |
+| `exclude_client_cpu` | `true` | 28 Nov. With `--parent-pid`, that process and its other descendants (for example jitmo's model-worker) are left out of "other programs' CPU", so the assistant's own router and tagger work does not cap its model. `/stats` → `pacer.client_pid`, `pacer.client_processes`. |
 
 The v0.1 keys `input_active_ms`, `others_cpu_busy_pct` and `busy_cpu_pct` are accepted and ignored (a warning is logged).
 
@@ -233,11 +236,11 @@ If a child goes over its cap, an allocation fails and llama-server exits. The ru
 |---|---|---|
 | `X-Jitmo-Request-Id` | request (optional) | Your own id for this request: 1 to 128 characters, letters, digits, `.`, `_`, `:`, `-`. Must not be in use by another running request (`409 request_id_in_use`). **Send your own id if you may need to cancel a non-streamed request**: its response headers only arrive when it is done. |
 | `X-Jitmo-Request-Id` | response | The request's id (yours, or a new one like `req-6b0284a9-7`). On every response from chat, chains and embeddings, also on errors. Chain reports also have it as `request_id`. |
-| `X-Jitmo-Priority` | request (optional) | `interactive` (default) or `background`. Waiting interactive requests run before waiting background ones; within one priority, first come first served. A running request is never interrupted. Anything else: `400`. |
+| `X-Jitmo-Priority` | request (optional) | `interactive` (default) or `background`. Waiting interactive requests run before waiting background ones; within one priority, first come first served. With `server.preempt_background` (default on), an interactive request that has to wait stops a running background request, which gets `503 preempted`. Anything else: `400`. |
 
 ## Endpoints
 
-All bodies are JSON. Errors look like OpenAI errors:
+All bodies are JSON, sent with `Content-Type: application/json`. Errors look like OpenAI errors:
 
 ```json
 { "error": { "message": "not enough free RAM to start model 'writer': ...", "type": "insufficient_memory", "code": "insufficient_memory" } }
@@ -250,11 +253,23 @@ All bodies are JSON. Errors look like OpenAI errors:
 | 404 | `model_not_found` / `chain_not_found` / `request_not_found` | Unknown model, chain, or request id (it may have finished). |
 | 409 | `request_id_in_use` | Your `X-Jitmo-Request-Id` belongs to another running request. |
 | 422 | `chain_step_failed` | A chain template could not be filled (for example a JSON field is missing). |
+| 403 | `forbidden` | Refused by the [local-only guard](#local-only-guard): an `Origin` header not in `allowed_origins`, a `Host` that is not this machine, or a POST body without `Content-Type: application/json`. |
 | 499 | `request_cancelled` | The request was cancelled with `DELETE /v1/requests/{id}`. |
 | 502 | `engine_error` | llama-server failed or went away during the request. |
 | 503 | `insufficient_memory` | Loading would break the pool budget or leave less than `reserve_free_mb` free, and nothing could be evicted. Retry later. |
 | 503 | `model_load_failed` | llama-server did not start (bad file, memory cap hit, timeout). |
 | 503 | `queue_full` | Too many requests waiting. |
+| 503 | `preempted` | 28 Nov. Your background request was stopped so an interactive one could run. Retry it later. A stream gets an error event with this code, then `[DONE]`. |
+
+### Local-only guard
+
+The API has no login, so web pages the user visits must not reach it (28 Nov):
+
+- A request with an `Origin` header (browsers add it to every cross-site POST and DELETE) is refused unless `server.allowed_origins` lists it. This stops a page's "simple" `text/plain` POST, which a browser sends without asking.
+- The `Host` must be `127.0.0.1`, `localhost`, `[::1]` or `server.host`. This stops DNS rebinding (a page on a name that resolves to 127.0.0.1).
+- A POST with a body must say `Content-Type: application/json`.
+
+Normal clients (jitmo, curl, scripts) pass without changes.
 
 Errors from llama-server itself (for example a prompt longer than the context) are passed through with llama-server's status and body.
 
@@ -568,15 +583,16 @@ Adapters are loaded with their model (`adapters = [...]` in the model, plus ever
 - Send `X-Jitmo-Priority: background` for work the user is not waiting for, and your own `X-Jitmo-Request-Id` for anything the user may cancel. On Esc: close the request, or `DELETE /v1/requests/{id}`.
 - For the writer with two inputs: a chain with `{question}` and `{passage}`, or simply a direct chat request with your own prompt.
 - Several models: give each its `[[models]]` entry; pin the small one you always need (the router) so it is never evicted. Set `pool_budget_mb` to your RAM rule.
-- Handle `503 insufficient_memory` (tell the user, or retry later), `503 queue_full` and `502 engine_error` (try again), `499` (your own cancel), and `503 memory_pressure` (v0.3: the runtime stopped the generation because RAM stayed short; tell the user, retry later).
+- Send `Content-Type: application/json` with every POST body.
+- Handle `503 preempted` on background requests (retry later), `503 insufficient_memory` (tell the user, or retry later), `503 queue_full` and `502 engine_error` (try again), `499` (your own cancel), and `503 memory_pressure` (v0.3: the runtime stopped the generation because RAM stayed short; tell the user, retry later).
 - Expect generation to be slower while other programs use the CPU (pacer levels). `GET /health` → `pacer_capped` and `/stats` → `pacer.level` say so.
 - Expect a model switch to cost a model load if the other model had to be evicted: measured 1.2 s for the 270M router and 1.8 to 2.1 s for Gemma 3n E2B (warm file cache); about 0 if both stay loaded.
 
 ## Limits of v0.3
 
-- One generation at a time across the pool by default; no batching inside a model (`--parallel 1`).
+- One generation at a time across the pool by default; no batching inside a model (`--parallel 1`). A preempted background request starts again from the beginning when retried.
 - Chain output is not streamed token by token.
-- No authentication. It listens on 127.0.0.1 only by default.
+- No authentication. It listens on 127.0.0.1 only by default, and the local-only guard refuses web pages. Other programs on the same PC can still call it, and can call the llama-server children's ports directly.
 - Token tagging (NER) and classification heads are not supported (llama.cpp has none). Embeddings are.
 - The pacer has one lever, a CPU cap per child. It cannot change threads per request and does not pause between tokens. Its signals are CPU and free RAM; memory-bandwidth contention is not measured yet.
 - The load estimate counts the whole prompt cache (`cache_ram_mb`, 256 MB), so for a small model that is used little it is about twice the real use. Override it with `load_estimate_mb` per model, or lower `cache_ram_mb`.

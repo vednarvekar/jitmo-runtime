@@ -2,8 +2,11 @@
 //! tokens, and the registry of in-flight requests (for `DELETE /v1/requests/{id}`).
 //!
 //! - `server.max_concurrent` slots (default 1: the models share the memory bandwidth).
-//! - Waiting requests are ordered interactive first, then by arrival. A running request is
-//!   never interrupted by priority.
+//! - Waiting requests are ordered interactive first, then by arrival.
+//! - Preemption (`server.preempt_background`, on by default): when an interactive request has
+//!   to wait and no slot runs interactive work, the newest running background request is
+//!   stopped with `503 preempted` (the client may retry it), so the interactive one starts at
+//!   once instead of after the whole background answer.
 //! - A waiting request that is cancelled (or whose client goes away) leaves the queue, because
 //!   its future is dropped; `QueueGuard` removes it.
 
@@ -84,31 +87,42 @@ impl CancelToken {
 struct Waiter {
     seq: u64,
     priority: Priority,
+    token: Option<CancelToken>,
     tx: oneshot::Sender<Permit>,
+}
+
+/// A slot in use.
+struct Running {
+    id: u64,
+    priority: Priority,
+    token: Option<CancelToken>,
 }
 
 #[derive(Default)]
 struct SchedInner {
-    running: usize,
+    running: Vec<Running>,
     seq: u64,
     queue: Vec<Waiter>,
+    preempted: u64,
 }
 
 pub struct Scheduler {
     max: usize,
     max_queue: usize,
+    preempt: bool,
     inner: Mutex<SchedInner>,
 }
 
 /// One generation slot. Dropping it hands the slot to the best waiting request.
 pub struct Permit {
     sched: Option<Arc<Scheduler>>,
+    id: u64,
 }
 
 impl Drop for Permit {
     fn drop(&mut self) {
         if let Some(s) = self.sched.take() {
-            s.release();
+            s.release(self.id);
         }
     }
 }
@@ -133,29 +147,53 @@ pub struct SchedSnapshot {
     pub waiting_interactive: usize,
     pub waiting_background: usize,
     pub max_queue: usize,
+    pub preempt_background: bool,
+    /// Background generations stopped for an interactive request, over the runtime's life.
+    pub preempted_total: u64,
 }
 
 impl Scheduler {
-    pub fn new(max_concurrent: usize, max_queue: usize) -> Arc<Scheduler> {
-        Arc::new(Scheduler { max: max_concurrent.max(1), max_queue, inner: Mutex::new(SchedInner::default()) })
+    pub fn new(max_concurrent: usize, max_queue: usize, preempt: bool) -> Arc<Scheduler> {
+        Arc::new(Scheduler { max: max_concurrent.max(1), max_queue, preempt, inner: Mutex::new(SchedInner::default()) })
+    }
+
+    fn start(&self, i: &mut SchedInner, priority: Priority, token: Option<CancelToken>) -> u64 {
+        i.seq += 1;
+        let id = i.seq;
+        i.running.push(Running { id, priority, token });
+        id
+    }
+
+    /// An interactive request must wait: if no slot runs interactive work, stop the newest
+    /// running background request that is not stopped yet.
+    fn preempt_for_interactive(&self, i: &mut SchedInner) {
+        if !self.preempt || i.running.iter().any(|r| r.priority == Priority::Interactive) {
+            return;
+        }
+        let victim = i.running.iter().rev().find_map(|r| r.token.clone().filter(|t| !t.is_cancelled()));
+        if let Some(t) = victim {
+            t.cancel_with(Error::preempted("stopped so an interactive request could run; retry later"));
+            i.preempted += 1;
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, SchedInner> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    pub async fn acquire(self: &Arc<Self>, priority: Priority) -> Result<Permit, Error> {
+    /// `token` = the request's cancel token, so a running background request can be preempted.
+    pub async fn acquire(self: &Arc<Self>, priority: Priority, token: Option<CancelToken>) -> Result<Permit, Error> {
         let (rx, seq) = {
             let mut i = self.lock();
             // Waiters exist only while every slot is taken, so a free slot means nobody is ahead.
-            if i.running < self.max && i.queue.is_empty() {
-                i.running += 1;
-                return Ok(Permit { sched: Some(self.clone()) });
+            if i.running.len() < self.max && i.queue.is_empty() {
+                let id = self.start(&mut i, priority, token);
+                return Ok(Permit { sched: Some(self.clone()), id });
             }
             if i.queue.len() >= self.max_queue {
                 return Err(Error::queue_full(format!(
                     "{} generation(s) running and {} requests waiting (server.max_queue = {})",
-                    i.running,
+                    i.running.len(),
                     i.queue.len(),
                     self.max_queue
                 )));
@@ -163,33 +201,28 @@ impl Scheduler {
             i.seq += 1;
             let seq = i.seq;
             let (tx, rx) = oneshot::channel();
-            i.queue.push(Waiter { seq, priority, tx });
+            i.queue.push(Waiter { seq, priority, token, tx });
+            if priority == Priority::Interactive {
+                self.preempt_for_interactive(&mut i);
+            }
             (rx, seq)
         };
         let _guard = QueueGuard { sched: self, seq };
         rx.await.map_err(|_| Error::engine("runtime is shutting down"))
     }
 
-    fn release(self: &Arc<Self>) {
-        loop {
-            let next = {
-                let mut i = self.lock();
-                let best = i.queue.iter().enumerate().min_by_key(|(_, w)| (w.priority, w.seq)).map(|(k, _)| k);
-                match best {
-                    Some(k) => i.queue.remove(k),
-                    None => {
-                        i.running = i.running.saturating_sub(1);
-                        return;
-                    }
-                }
-            };
-            // The slot passes to `next` (running stays the same). If its request is gone,
-            // try the next waiter.
-            match next.tx.send(Permit { sched: Some(self.clone()) }) {
-                Ok(()) => return,
-                Err(mut p) => {
-                    p.sched = None;
-                }
+    fn release(self: &Arc<Self>, id: u64) {
+        let mut i = self.lock();
+        i.running.retain(|r| r.id != id);
+        // Hand the free slot to the best waiter. If its request is gone, try the next one.
+        while i.running.len() < self.max {
+            let best = i.queue.iter().enumerate().min_by_key(|(_, w)| (w.priority, w.seq)).map(|(k, _)| k);
+            let Some(k) = best else { return };
+            let w = i.queue.remove(k);
+            let id = self.start(&mut i, w.priority, w.token);
+            if let Err(mut p) = w.tx.send(Permit { sched: Some(self.clone()), id }) {
+                p.sched = None; // not handed over: free the slot here, without re-entering release
+                i.running.retain(|r| r.id != id);
             }
         }
     }
@@ -199,11 +232,13 @@ impl Scheduler {
         let bg = i.queue.iter().filter(|w| w.priority == Priority::Background).count();
         SchedSnapshot {
             max_concurrent: self.max,
-            running: i.running,
+            running: i.running.len(),
             waiting: i.queue.len(),
             waiting_interactive: i.queue.len() - bg,
             waiting_background: bg,
             max_queue: self.max_queue,
+            preempt_background: self.preempt,
+            preempted_total: i.preempted,
         }
     }
 }
@@ -346,16 +381,16 @@ mod tests {
     use std::time::Duration;
 
     async fn take(s: Arc<Scheduler>, p: Priority, log: Arc<Mutex<Vec<&'static str>>>, name: &'static str) {
-        let _permit = s.acquire(p).await.unwrap();
+        let _permit = s.acquire(p, None).await.unwrap();
         log.lock().unwrap().push(name);
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
     #[tokio::test]
     async fn interactive_requests_go_before_queued_background_ones() {
-        let s = Scheduler::new(1, 8);
+        let s = Scheduler::new(1, 8, false);
         let log = Arc::new(Mutex::new(Vec::new()));
-        let first = s.acquire(Priority::Background).await.unwrap(); // running, not interrupted
+        let first = s.acquire(Priority::Background, None).await.unwrap(); // running, not interrupted
         let mut tasks = Vec::new();
         for (p, name) in [(Priority::Background, "bg1"), (Priority::Background, "bg2"), (Priority::Interactive, "ia1"), (Priority::Interactive, "ia2")] {
             tasks.push(tokio::spawn(take(s.clone(), p, log.clone(), name)));
@@ -372,32 +407,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_dropped_waiter_leaves_the_queue_and_the_queue_is_bounded() {
-        let s = Scheduler::new(1, 1);
-        let held = s.acquire(Priority::Interactive).await.unwrap();
+    async fn an_interactive_request_preempts_a_running_background_one() {
+        let s = Scheduler::new(1, 8, true);
+        let bg = CancelToken::default();
+        let held = s.acquire(Priority::Background, Some(bg.clone())).await.unwrap();
+        // A background waiter does not preempt.
         let s2 = s.clone();
-        let waiter = tokio::spawn(async move { s2.acquire(Priority::Interactive).await.map(|_| ()) });
+        let bg2 = tokio::spawn(async move { s2.acquire(Priority::Background, Some(CancelToken::default())).await.map(|_| ()) });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(!bg.is_cancelled());
+        let s3 = s.clone();
+        let ia = tokio::spawn(async move { s3.acquire(Priority::Interactive, None).await.map(|_| "ia") });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(bg.is_cancelled(), "the running background request is stopped");
+        assert_eq!(bg.reason().unwrap().code, "preempted");
+        assert_eq!(s.snapshot().preempted_total, 1);
+        drop(held); // the stopped work ends and frees its slot
+        assert_eq!(ia.await.unwrap().unwrap(), "ia");
+        bg2.await.unwrap().unwrap();
+        assert_eq!(s.snapshot().running, 0);
+    }
+
+    #[tokio::test]
+    async fn no_preemption_when_off_or_interactive_is_running() {
+        let off = Scheduler::new(1, 8, false);
+        let bg = CancelToken::default();
+        let held = off.acquire(Priority::Background, Some(bg.clone())).await.unwrap();
+        let o2 = off.clone();
+        let w = tokio::spawn(async move { o2.acquire(Priority::Interactive, None).await.map(|_| ()) });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(!bg.is_cancelled());
+        drop(held);
+        w.await.unwrap().unwrap();
+
+        let on = Scheduler::new(2, 8, true);
+        let bg = CancelToken::default();
+        let _ia = on.acquire(Priority::Interactive, None).await.unwrap();
+        let _b = on.acquire(Priority::Background, Some(bg.clone())).await.unwrap();
+        let o3 = on.clone();
+        let _w = tokio::spawn(async move { o3.acquire(Priority::Interactive, None).await.map(|_| ()) });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(!bg.is_cancelled(), "interactive work already runs, so background keeps going");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_waiter_leaves_the_queue_and_the_queue_is_bounded() {
+        let s = Scheduler::new(1, 1, true);
+        let held = s.acquire(Priority::Interactive, None).await.unwrap();
+        let s2 = s.clone();
+        let waiter = tokio::spawn(async move { s2.acquire(Priority::Interactive, None).await.map(|_| ()) });
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert_eq!(s.snapshot().waiting, 1);
-        assert!(s.acquire(Priority::Interactive).await.is_err(), "queue full");
+        assert!(s.acquire(Priority::Interactive, None).await.is_err(), "queue full");
         waiter.abort();
         let _ = waiter.await;
         assert_eq!(s.snapshot().waiting, 0, "an aborted waiter is removed");
         drop(held);
         assert_eq!(s.snapshot().running, 0);
-        let again = s.acquire(Priority::Background).await.unwrap();
+        let again = s.acquire(Priority::Background, None).await.unwrap();
         assert_eq!(s.snapshot().running, 1);
         drop(again);
     }
 
     #[tokio::test]
     async fn max_concurrent_two_runs_two() {
-        let s = Scheduler::new(2, 4);
-        let a = s.acquire(Priority::Interactive).await.unwrap();
-        let _b = s.acquire(Priority::Interactive).await.unwrap();
+        let s = Scheduler::new(2, 4, true);
+        let a = s.acquire(Priority::Interactive, None).await.unwrap();
+        let _b = s.acquire(Priority::Interactive, None).await.unwrap();
         assert_eq!(s.snapshot().running, 2);
         let s2 = s.clone();
-        let c = tokio::spawn(async move { s2.acquire(Priority::Interactive).await.is_ok() });
+        let c = tokio::spawn(async move { s2.acquire(Priority::Interactive, None).await.is_ok() });
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert_eq!(s.snapshot().waiting, 1);
         drop(a);

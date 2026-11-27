@@ -339,7 +339,7 @@ pub struct RunInput<'a> {
 pub async fn run(pool: &Pool, chain: &Chain, run: RunInput<'_>, req: &RequestGuard) -> Result<ChainReport, Error> {
     let started = Instant::now();
     let overrides = chain.check_run(run.vars, run.system)?;
-    let permit = pool.sched.acquire(req.priority).await.inspect_err(|e| {
+    let permit = pool.sched.acquire(req.priority, Some(req.token.clone())).await.inspect_err(|e| {
         if e.code == "queue_full" {
             pool.stats.refused_queue();
         }

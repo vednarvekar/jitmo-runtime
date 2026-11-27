@@ -49,6 +49,14 @@ impl Error {
     pub fn memory_pressure(m: impl Into<String>) -> Error {
         Error::new(503, "memory_pressure", m)
     }
+    /// Refused by the local-only guard (a web page, a foreign Host, a non-JSON body).
+    pub fn forbidden(m: impl Into<String>) -> Error {
+        Error::new(403, "forbidden", m)
+    }
+    /// A background generation stopped so a waiting interactive request can run.
+    pub fn preempted(m: impl Into<String>) -> Error {
+        Error::new(503, "preempted", m)
+    }
     pub fn request_not_found(m: impl Into<String>) -> Error {
         Error::new(404, "request_not_found", m)
     }

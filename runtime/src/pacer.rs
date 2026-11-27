@@ -12,7 +12,9 @@
 //!
 //! v2 (owner decision, 22 Nov 2026): no keyboard/mouse signal. Signals, sampled every
 //! `poll_ms`:
-//! - CPU used by other processes (system busy time minus all children's job CPU time),
+//! - CPU used by other processes (system busy time minus all children's job CPU time, and
+//!   minus the client's own processes: `--parent-pid` and its other descendants, because the
+//!   assistant's own router/tagger work is not "another program needs the PC"),
 //!   averaged over the last `smooth_ms` so one short spike does not count;
 //! - free RAM.
 //!
@@ -179,16 +181,16 @@ pub fn cpu_rate(cap_pct: u32, threads: u32, logical: u32) -> u32 {
     ((cap_pct as f64 / 100.0) * full * 10_000.0).round().clamp(1.0, 10_000.0) as u32
 }
 
-/// CPU used by processes other than the children, in % of all logical processors, between two samples.
-pub fn others_cpu_pct(prev: SystemTimes, now: SystemTimes, child_prev: u64, child_now: u64) -> Option<f64> {
+/// CPU used by other processes, in % of all logical processors, between two samples.
+/// `excluded` = CPU time of the children (and the client's processes) in that interval.
+pub fn others_cpu_pct(prev: SystemTimes, now: SystemTimes, excluded: u64) -> Option<f64> {
     let total = now.total.checked_sub(prev.total)?;
     let idle = now.idle.checked_sub(prev.idle)?;
     if total == 0 {
         return None;
     }
     let busy = total.saturating_sub(idle);
-    let child = child_now.saturating_sub(child_prev);
-    Some(busy.saturating_sub(child) as f64 * 100.0 / total as f64)
+    Some(busy.saturating_sub(excluded) as f64 * 100.0 / total as f64)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -207,6 +209,9 @@ pub struct PacerSnapshot {
     pub cap_pct_of_system: f64,
     pub others_cpu_pct: Option<f64>,
     pub free_mb: Option<u64>,
+    /// The client process left out of `others_cpu_pct` (`--parent-pid`), and how many of its processes.
+    pub client_pid: Option<u32>,
+    pub client_processes: usize,
     /// Planned signal (memory-bandwidth probe); always null for now.
     pub mem_latency_ns: Option<f64>,
     pub thresholds: Value,
@@ -239,7 +244,17 @@ struct Sample {
     at: Instant,
     sys: SystemTimes,
     children: HashMap<u32, u64>,
+    /// CPU time of the client's processes (see `Pacer::set_client`).
+    clients: HashMap<u32, u64>,
 }
+
+/// CPU time used between two samples by the pids present in both.
+fn delta(old: &HashMap<u32, u64>, new: &HashMap<u32, u64>) -> u64 {
+    new.iter().filter_map(|(pid, t)| old.get(pid).map(|o| t.saturating_sub(*o))).sum()
+}
+
+/// How often the client's process tree is listed again.
+const CLIENT_TREE_REFRESH: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 struct Inner {
@@ -263,6 +278,9 @@ struct Inner {
     gens_uncapped: u64,
     tps_capped: Option<f64>,
     tps_uncapped: Option<f64>,
+    /// The client's process tree and when it was listed.
+    client_tree: Vec<u32>,
+    client_tree_at: Option<Instant>,
 }
 
 /// One pacer for the whole pool: the signals are sampled once, "other processes' CPU" leaves
@@ -272,6 +290,9 @@ pub struct Pacer {
     t: Thresholds,
     logical: u32,
     base_priority: u32,
+    /// The process that started the runtime (`--parent-pid`): its CPU, and its other
+    /// children's, is the assistant's own work, not "other programs".
+    client: Mutex<Option<u32>>,
     inner: Mutex<Inner>,
 }
 
@@ -289,7 +310,27 @@ impl Pacer {
         }
         let base_priority = if low_priority { win::BELOW_NORMAL_PRIORITY_CLASS } else { win::NORMAL_PRIORITY_CLASS };
         let t = Thresholds::from_config(&cfg, pressure_free_mb);
-        Pacer { cfg, t, logical, base_priority, inner: Mutex::new(Inner::default()) }
+        Pacer { cfg, t, logical, base_priority, client: Mutex::new(None), inner: Mutex::new(Inner::default()) }
+    }
+
+    /// Leave this process and its descendants (other than the runtime) out of "other
+    /// programs' CPU", if `pacer.exclude_client_cpu` is on.
+    pub fn set_client(&self, pid: u32) {
+        if self.cfg.exclude_client_cpu {
+            *self.client.lock().unwrap_or_else(|p| p.into_inner()) = Some(pid);
+        }
+    }
+
+    /// CPU times of the client's processes; the tree is listed again every few seconds.
+    fn client_times(&self, i: &mut Inner, now: Instant) -> HashMap<u32, u64> {
+        let Some(root) = *self.client.lock().unwrap_or_else(|p| p.into_inner()) else {
+            return HashMap::new();
+        };
+        if i.client_tree_at.is_none_or(|t| now - t >= CLIENT_TREE_REFRESH) {
+            i.client_tree = win::process_tree(&win::process_parents(), root, std::process::id());
+            i.client_tree_at = Some(now);
+        }
+        i.client_tree.iter().filter_map(|&pid| win::process_cpu_time(pid).map(|t| (pid, t))).collect()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -348,7 +389,8 @@ impl Pacer {
         }
         let child_old: u64 = old.children.values().sum();
         let child_new: u64 = new.children.values().sum();
-        others_cpu_pct(old.sys, new.sys, child_old, child_new)
+        let excluded = child_new.saturating_sub(child_old) + delta(&old.clients, &new.clients);
+        others_cpu_pct(old.sys, new.sys, excluded)
     }
 
     /// One sample and decision for all loaded children.
@@ -357,6 +399,7 @@ impl Pacer {
         let sys = win::system_times();
         let cpu: HashMap<u32, u64> = children.iter().filter_map(|c| c.job.cpu_time().map(|t| (c.pid, t))).collect();
         let mut i = self.lock();
+        let clients = self.client_times(&mut i, now);
         if let Some(last) = i.last_tick.replace(now) {
             if !children.is_empty() {
                 let k = i.level as usize;
@@ -364,7 +407,7 @@ impl Pacer {
             }
         }
         let others = match sys {
-            Some(sys) if cpu.len() == children.len() => self.smoothed_others(&mut i, Sample { at: now, sys, children: cpu }),
+            Some(sys) if cpu.len() == children.len() => self.smoothed_others(&mut i, Sample { at: now, sys, children: cpu, clients }),
             _ => {
                 i.window.clear();
                 None
@@ -479,6 +522,8 @@ impl Pacer {
             cap_pct_of_system: self.rate_for(i.level, threads).map_or(100.0, |r| r as f64 / 100.0),
             others_cpu_pct: i.signals.others_cpu_pct,
             free_mb: i.signals.free_mb,
+            client_pid: *self.client.lock().unwrap_or_else(|p| p.into_inner()),
+            client_processes: i.client_tree.len(),
             mem_latency_ns: None,
             thresholds: json!({
                 "light_cpu_pct": self.t.light_cpu_pct, "heavy_cpu_pct": self.t.heavy_cpu_pct, "low_free_mb": self.t.low_free_mb,
@@ -677,9 +722,22 @@ mod tests {
         let p = SystemTimes { idle: 0, total: 0 };
         // 8 CPUs x 1 s = 80_000_000 units; 50% busy, of which the children used 30%.
         let n = SystemTimes { idle: 40_000_000, total: 80_000_000 };
-        let pct = others_cpu_pct(p, n, 0, 24_000_000).unwrap();
+        let pct = others_cpu_pct(p, n, 24_000_000).unwrap();
         assert!((pct - 20.0).abs() < 1e-9);
-        assert_eq!(others_cpu_pct(n, n, 0, 0), None);
+        assert_eq!(others_cpu_pct(n, n, 0), None);
+        // Only pids seen in both samples count (a new or gone process has no interval).
+        let old = HashMap::from([(10, 100), (11, 50)]);
+        let new = HashMap::from([(10, 400), (12, 999)]);
+        assert_eq!(delta(&old, &new), 300);
+    }
+
+    #[test]
+    fn client_tree_follows_children_and_skips_the_runtime() {
+        // 1 = jitmo; 2 = its model-worker; 3 = the runtime; 4 = a llama-server; 5 = worker's child; 9 = unrelated.
+        let parents = [(1, 0), (2, 1), (3, 1), (4, 3), (5, 2), (9, 7)];
+        let mut t = win::process_tree(&parents, 1, 3);
+        t.sort();
+        assert_eq!(t, vec![1, 2, 5]);
     }
 
     #[test]

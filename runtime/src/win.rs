@@ -138,8 +138,30 @@ struct SYSTEM_LOGICAL_PROCESSOR_INFORMATION {
     Union: [u64; 2],
 }
 
+const TH32CS_SNAPPROCESS: u32 = 0x2;
+const INVALID_HANDLE_VALUE: isize = -1;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PROCESSENTRY32W {
+    dwSize: u32,
+    cntUsage: u32,
+    th32ProcessID: u32,
+    th32DefaultHeapID: usize,
+    th32ModuleID: u32,
+    cntThreads: u32,
+    th32ParentProcessID: u32,
+    pcPriClassBase: i32,
+    dwFlags: u32,
+    szExeFile: [u16; 260],
+}
+
 #[link(name = "kernel32")]
 extern "system" {
+    fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> HANDLE;
+    fn Process32FirstW(snap: HANDLE, e: *mut PROCESSENTRY32W) -> BOOL;
+    fn Process32NextW(snap: HANDLE, e: *mut PROCESSENTRY32W) -> BOOL;
+    fn GetProcessTimes(p: HANDLE, create: *mut FILETIME, exit: *mut FILETIME, kernel: *mut FILETIME, user: *mut FILETIME) -> BOOL;
     fn GlobalMemoryStatusEx(m: *mut MEMORYSTATUSEX) -> BOOL;
     fn CreateJobObjectW(sa: *mut c_void, name: *const u16) -> HANDLE;
     fn SetInformationJobObject(job: HANDLE, class: i32, info: *mut c_void, len: u32) -> BOOL;
@@ -377,6 +399,60 @@ pub fn system_times() -> Option<SystemTimes> {
     // SAFETY: three valid out-pointers.
     let ok = unsafe { GetSystemTimes(&mut i, &mut k, &mut u) } != 0;
     ok.then(|| SystemTimes { idle: i.get(), total: k.get() + u.get() })
+}
+
+/// Every process as (pid, parent pid).
+pub fn process_parents() -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    // SAFETY: plain Toolhelp calls on a snapshot handle that is closed before returning.
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap.is_null() || snap as isize == INVALID_HANDLE_VALUE {
+            return out;
+        }
+        let mut e: PROCESSENTRY32W = std::mem::zeroed();
+        e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut ok = Process32FirstW(snap, &mut e) != 0;
+        while ok {
+            out.push((e.th32ProcessID, e.th32ParentProcessID));
+            ok = Process32NextW(snap, &mut e) != 0;
+        }
+        CloseHandle(snap);
+    }
+    out
+}
+
+/// `root` and all its descendants, leaving out `skip` and the descendants of `skip`.
+/// Parent pids can be stale (Windows reuses pids), so a pid is only followed from a parent
+/// already in the tree.
+pub fn process_tree(parents: &[(u32, u32)], root: u32, skip: u32) -> Vec<u32> {
+    let mut tree = vec![root];
+    let mut k = 0;
+    while k < tree.len() {
+        let p = tree[k];
+        for &(pid, parent) in parents {
+            if parent == p && pid != skip && pid != 0 && pid != parent && !tree.contains(&pid) {
+                tree.push(pid);
+            }
+        }
+        k += 1;
+    }
+    tree
+}
+
+/// Kernel + user CPU time of a process, in 100 ns units.
+pub fn process_cpu_time(pid: u32) -> Option<u64> {
+    // SAFETY: plain Win32 calls; the handle is closed before returning.
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return None;
+        }
+        let (mut c, mut e, mut k, mut u) = (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+        let ok = GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u) != 0;
+        CloseHandle(h);
+        ok.then(|| k.get() + u.get())
+    }
 }
 
 /// Set the priority class of a process by PID.
