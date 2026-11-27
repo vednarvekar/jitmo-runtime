@@ -8,7 +8,7 @@
 //! llama-server-style `timings` (`prompt_n` = prompt tokens read, `cache_n` = reused).
 //! Closing the connection stops the generation (checked between tokens).
 
-use crate::engine::{self, Finish, GenStats, LoadOptions, Model, SamplerOpts, Step};
+use crate::engine::{self, Finish, GenStats, LoadOptions, Model, Pace, SamplerOpts, Step};
 use anyhow::{anyhow, bail, Context as _, Result};
 use axum::body::{Body, Bytes};
 use axum::extract::State;
@@ -18,7 +18,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc as tmpsc;
@@ -96,6 +96,22 @@ struct Job {
     events: tmpsc::UnboundedSender<Event>,
 }
 
+/// Set by the runtime's pacer (`POST /pace`): run this share of the time between tokens, and
+/// this many threads (0 = the start value).
+pub struct PaceCtl {
+    duty_pct: AtomicU32,
+    threads: AtomicI32,
+}
+
+/// The pause after a step that took `step` so the model computes `duty_pct` % of the time.
+pub fn duty_pause(step: Duration, duty_pct: u32) -> Duration {
+    if duty_pct >= 100 || duty_pct == 0 {
+        return Duration::ZERO;
+    }
+    // Cap one pause at 500 ms: a slow step (a long prompt) must not freeze the stream.
+    step.mul_f64(100.0 / duty_pct as f64 - 1.0).min(Duration::from_millis(500))
+}
+
 /// Sets the cancel flag when the request goes away (client closed the connection).
 struct CancelOnDrop(Arc<AtomicBool>);
 
@@ -144,8 +160,11 @@ impl StopFilter {
     }
 }
 
-fn engine_thread(mut model: Model, jobs: mpsc::Receiver<Job>) {
+fn engine_thread(mut model: Model, jobs: mpsc::Receiver<Job>, pace: Arc<PaceCtl>) {
+    let start_threads = model.threads();
     for job in jobs {
+        let want = pace.threads.load(Ordering::SeqCst);
+        model.set_threads(if want > 0 { want } else { start_threads });
         let prompt = match model.apply_template(&job.messages) {
             Ok(p) => p,
             Err(e) => {
@@ -172,7 +191,13 @@ fn engine_thread(mut model: Model, jobs: mpsc::Receiver<Job>) {
                     Step::Continue
                 }
             },
-            |_| Duration::ZERO,
+            |_, step| {
+                let t = pace.threads.load(Ordering::SeqCst);
+                Pace {
+                    pause: duty_pause(step, pace.duty_pct.load(Ordering::SeqCst)),
+                    threads: Some(if t > 0 { t } else { start_threads }),
+                }
+            },
         );
         match r {
             Ok(stats) => {
@@ -195,6 +220,7 @@ struct App {
     name: String,
     n_ctx: usize,
     jobs: std::sync::Mutex<mpsc::Sender<Job>>,
+    pace: Arc<PaceCtl>,
 }
 
 fn error(status: u16, msg: impl Into<String>) -> Response {
@@ -281,6 +307,25 @@ fn finish_reason(f: Finish) -> &'static str {
 
 async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
+}
+
+/// `{"duty_pct": 50, "threads": 2}`: the pacer's level, applied from the next token.
+async fn set_pace(State(app): State<Arc<App>>, body: Bytes) -> Response {
+    let v: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return error(400, format!("body is not valid JSON: {e}")),
+    };
+    if let Some(d) = v["duty_pct"].as_u64() {
+        app.pace.duty_pct.store(d.clamp(1, 100) as u32, Ordering::SeqCst);
+    }
+    if let Some(t) = v["threads"].as_i64() {
+        app.pace.threads.store(t.clamp(0, 256) as i32, Ordering::SeqCst);
+    }
+    get_pace(State(app)).await.into_response()
+}
+
+async fn get_pace(State(app): State<Arc<App>>) -> Json<Value> {
+    Json(json!({ "duty_pct": app.pace.duty_pct.load(Ordering::SeqCst), "threads": app.pace.threads.load(Ordering::SeqCst) }))
 }
 
 async fn chat(State(app): State<Arc<App>>, body: Bytes) -> Response {
@@ -400,10 +445,13 @@ pub async fn run(args: &[String]) -> Result<()> {
     let model = Model::load(lib, &w.model, &opts)?;
     let n_ctx = model.n_ctx();
     let (tx, rx) = mpsc::channel();
-    std::thread::Builder::new().name("engine".into()).spawn(move || engine_thread(model, rx))?;
-    let app = Arc::new(App { name: w.name.clone(), n_ctx, jobs: std::sync::Mutex::new(tx) });
+    let pace = Arc::new(PaceCtl { duty_pct: AtomicU32::new(100), threads: AtomicI32::new(0) });
+    let p = pace.clone();
+    std::thread::Builder::new().name("engine".into()).spawn(move || engine_thread(model, rx, p))?;
+    let app = Arc::new(App { name: w.name.clone(), n_ctx, jobs: std::sync::Mutex::new(tx), pace });
     let router = Router::new()
         .route("/health", get(health))
+        .route("/pace", get(get_pace).post(set_pace))
         .route("/v1/chat/completions", post(chat))
         .with_state(app);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", w.port)).await.with_context(|| format!("cannot listen on port {}", w.port))?;
@@ -427,6 +475,15 @@ mod tests {
         assert_eq!(g.push("abc E"), ("abc ".into(), false));
         assert_eq!(g.push("x"), ("Ex".into(), false), "not a stop string after all");
         assert_eq!(g.rest(), "");
+    }
+
+    #[test]
+    fn duty_cycle_pause() {
+        let ms = Duration::from_millis;
+        assert_eq!(duty_pause(ms(40), 100), Duration::ZERO);
+        assert_eq!(duty_pause(ms(40), 50), ms(40), "50%: pause as long as the step");
+        assert!((duty_pause(ms(30), 75).as_secs_f64() - 0.010).abs() < 1e-9, "75%: a third of the step");
+        assert_eq!(duty_pause(ms(2000), 50), ms(500), "capped");
     }
 
     #[test]

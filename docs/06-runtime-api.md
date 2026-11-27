@@ -199,6 +199,7 @@ See [Pacer](#pacer) for how it works.
 | `heavy_hysteresis_pct` | `10.0` | v0.3. To leave heavy, other programs' CPU must be this many points below `heavy_cpu_pct` (so under 30%). |
 | `heavy_release_after_ms` | `10000` | v0.3. Heavy goes down only after CPU (under `heavy_cpu_pct - heavy_hysteresis_pct`) and RAM (256 MB above `low_free_mb`) have stayed clear for this long **in a row**. Any sample above that line restarts the wait. |
 | `busy_priority` | `"unchanged"` | `idle` = also drop the children to idle priority while capped. |
+| `inproc_lever` | `"pause"` | 28 Nov. How `engine = "inproc"` models are slowed. `pause`: no CPU cap; the worker pauses after each token so it computes `light_cap_pct` / `heavy_cap_pct` of the time, and uses one thread less at heavy (`GET /pace` on the worker shows it). `cap`: the Job Object CPU cap, as for llama-server. |
 | `exclude_client_cpu` | `true` | 28 Nov. With `--parent-pid`, that process and its other descendants (for example jitmo's model-worker) are left out of "other programs' CPU", so the assistant's own router and tagger work does not cap its model. `/stats` → `pacer.client_pid`, `pacer.client_processes`. |
 
 The v0.1 keys `input_active_ms`, `others_cpu_busy_pct` and `busy_cpu_pct` are accepted and ignored (a warning is logged).

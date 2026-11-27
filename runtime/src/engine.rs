@@ -327,6 +327,16 @@ pub struct Model {
     n_ctx: usize,
     /// Tokens now in the KV cache (sequence 0), for prefix reuse.
     cached: Vec<llama_token>,
+    /// Threads set on the context now.
+    threads: i32,
+}
+
+/// What the pace hook asks for before the next token.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Pace {
+    pub pause: Duration,
+    /// Change the thread count (takes effect from the next decode).
+    pub threads: Option<i32>,
 }
 
 // The pointers are only used from the thread that owns the Model.
@@ -398,7 +408,7 @@ impl Model {
             let t = (lib.model_chat_template)(model, null());
             let template = (!t.is_null()).then(|| CStr::from_ptr(t).to_owned());
             let n_ctx = (lib.n_ctx)(ctx) as usize;
-            Ok(Model { lib, model, ctx, vocab, template, n_ctx, cached: Vec::new() })
+            Ok(Model { lib, model, ctx, vocab, template, n_ctx, cached: Vec::new(), threads: o.threads })
         }
     }
 
@@ -406,9 +416,16 @@ impl Model {
         self.n_ctx
     }
 
-    pub fn set_threads(&self, n: i32) {
-        // SAFETY: valid context.
-        unsafe { (self.lib.set_n_threads)(self.ctx, n, n) }
+    pub fn set_threads(&mut self, n: i32) {
+        if n > 0 && n != self.threads {
+            // SAFETY: valid context; between decodes.
+            unsafe { (self.lib.set_n_threads)(self.ctx, n, n) }
+            self.threads = n;
+        }
+    }
+
+    pub fn threads(&self) -> i32 {
+        self.threads
     }
 
     /// Format (role, content) messages with the model's built-in chat template.
@@ -501,8 +518,9 @@ impl Model {
 
     /// Generate from a formatted prompt. The KV cache of the shared prefix with the previous
     /// prompt is reused. `on_text` gets valid UTF-8 pieces and may stop the generation; `pace`
-    /// runs between tokens and returns how long to pause (the pause point a server can't give
-    /// us). `cancel` is checked between tokens.
+    /// runs between tokens with the token count and the last step's compute time, and returns
+    /// a pause and/or a new thread count (the control point a server can't give us). `cancel`
+    /// is checked between tokens.
     pub fn generate(
         &mut self,
         prompt: &str,
@@ -511,7 +529,7 @@ impl Model {
         s: &SamplerOpts,
         cancel: &std::sync::atomic::AtomicBool,
         mut on_text: impl FnMut(&str) -> Step,
-        mut pace: impl FnMut(usize) -> Duration,
+        mut pace: impl FnMut(usize, Duration) -> Pace,
     ) -> Result<GenStats> {
         use std::sync::atomic::Ordering;
         let toks = self.tokenize(prompt)?;
@@ -550,6 +568,7 @@ impl Model {
         let mut utf8 = Utf8Buf::default();
         let mut paused = Duration::ZERO;
         let mut n = 0;
+        let mut work_start = Instant::now();
         let finish = loop {
             if cancel.load(Ordering::SeqCst) {
                 break Finish::Cancelled;
@@ -570,11 +589,15 @@ impl Model {
                     break Finish::Stop;
                 }
             }
-            let wait = pace(n);
-            if !wait.is_zero() {
-                std::thread::sleep(wait);
-                paused += wait;
+            let p = pace(n, work_start.elapsed());
+            if let Some(t) = p.threads {
+                self.set_threads(t);
             }
+            if !p.pause.is_zero() {
+                std::thread::sleep(p.pause);
+                paused += p.pause;
+            }
+            work_start = Instant::now();
             // SAFETY: our own context; one token.
             let rc = unsafe { (self.lib.decode)(self.ctx, (self.lib.batch_get_one)(&mut t, 1)) };
             if rc != 0 {
@@ -654,7 +677,7 @@ pub fn run_test(args: &[String]) -> Result<()> {
         let g = m.generate(&formatted, max, grammar.as_deref(), &greedy, &never, |p| {
             text.push_str(p);
             Step::Continue
-        }, |_| Duration::from_millis(pause_ms))?;
+        }, |_, _| Pace { pause: Duration::from_millis(pause_ms), threads: None })?;
         let tps = if g.gen_ms - g.paused_ms > 0.0 { g.tokens as f64 * 1000.0 / (g.gen_ms - g.paused_ms) } else { 0.0 };
         println!(
             "{}",

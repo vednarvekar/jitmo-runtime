@@ -177,6 +177,31 @@ critical_free_mb = 150
         proc.wait(15)
     except subprocess.TimeoutExpired:
         proc.kill()
+
+    # Part 2: pacer mode "always" -> the worker is paced (pauses between tokens, one thread less).
+    cfg2 = os.path.join(tmp, "inproc_paced.toml")
+    open(cfg2, "w").write(open(cfg).read().replace("[budget]", "[pacer]\nmode = \"always\"\n[budget]"))
+    pf2 = os.path.join(tmp, "port2.txt")
+    proc2 = subprocess.Popen([EXE, "--config", cfg2, "--port", "0", "--parent-pid", str(os.getpid()), "--port-file", pf2,
+                              "--log-file", os.path.join(tmp, "runtime2.log")], stdout=subprocess.DEVNULL)
+    for _ in range(100):
+        if os.path.exists(pf2):
+            break
+        time.sleep(0.1)
+    base2 = "http://127.0.0.1:" + open(pf2).read().split("port=")[1].strip()
+    req(base2, "POST", "/admin/load", {"model": "router"})
+    time.sleep(1.5)  # a pacer tick or two
+    st, s, _ = req(base2, "GET", "/stats")
+    wport = [m for m in s.get("models", []) if m["name"] == "router"][0].get("child", {}) or {}
+    wport = wport.get("port")
+    st, pace, _ = req("http://127.0.0.1:%s" % wport, "GET", "/pace") if wport else (0, {}, {})
+    check("pacer always -> worker told 50% duty, one thread less", st == 200 and pace.get("duty_pct") == 50 and pace.get("threads", 0) >= 1, pace)
+    st, b, _ = req(base2, "POST", "/v1/chat/completions", chat("router", "Write a short story about a cat.", max_tokens=40))
+    tm = b.get("timings", {}) if st == 200 else {}
+    ratio = tm.get("paused_ms", 0) / max(tm.get("predicted_ms", 1), 1)
+    check("paced generation pauses about half the time", st == 200 and 0.3 < ratio < 0.7, f"paused {ratio:.0%} of {tm.get('predicted_ms', 0):.0f} ms")
+    proc2.terminate()
+
     print("ALL CHECKS PASSED" if failed == 0 else f"{failed} CHECK(S) FAILED")
     sys.exit(1 if failed else 0)
 

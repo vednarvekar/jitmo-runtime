@@ -1,6 +1,6 @@
 # 08. Our own engine host: llama.cpp as a library
 
-Started 28 Nov 2026. Status: **P0 and P1 done (28 Nov).** Today each model is a `llama-server` child; this replaces it step by step, behind a per-model switch. The HTTP API does not change.
+Started 28 Nov 2026. Status: **P0, P1 done; P2 built (28 Nov), its UI-lag benefit not measured yet.** Today each model is a `llama-server` child; this replaces it step by step, behind a per-model switch. The HTTP API does not change.
 
 ## Why
 
@@ -43,6 +43,6 @@ Started 28 Nov 2026. Status: **P0 and P1 done (28 Nov).** Today each model is a 
 |---|---|---|
 | P0 | Proof of concept: load, tokenize, template, prefill, greedy decode, a pause hook | Same text and similar tok/s as llama-server, same model and threads |
 | P1 | `engine = "inproc"` per model; chat completions with grammar, simple JSON schema, streaming, cancel | **Done 28 Nov**: `runtime/scripts/smoke_inproc.py` 15/15 (CPU and Vulkan), old smoke test still passes |
-| P2 | Pacer v3: pause between tokens and live thread changes | UI-lag test better than the CPU cap at the same model speed |
+| P2 | Pacer v3: pause between tokens and live thread changes | **Built 28 Nov** (`pacer.inproc_lever = "pause"`; smoke: heavy level → 50% duty, 2 of 3 threads, paused 49% of the time). Still to do: UI-lag test against the CPU cap at the same model speed, on a quiet PC |
 | P3 | One base model shared by jobs, LoRA per job, prompt cache by KV state | RAM and switch-time measured |
 | P4 | Engine in our own worker process | A crash in the engine leaves the runtime running |

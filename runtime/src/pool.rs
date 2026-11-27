@@ -188,7 +188,12 @@ impl ModelHandle {
     }
 
     fn child(&self) -> Option<pacer::Child> {
-        lock(&self.info).as_ref().map(|i| pacer::Child { pid: i.pid, job: i.job.clone(), threads: self.threads })
+        lock(&self.info).as_ref().map(|i| pacer::Child {
+            pid: i.pid,
+            job: i.job.clone(),
+            threads: self.threads,
+            pace_port: self.cfg.inproc().then_some(i.port),
+        })
     }
 
     /// Live memory of the child, if it is loaded.
@@ -746,11 +751,31 @@ impl Pool {
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(pool.pacer.poll_interval());
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // The pace last sent to each inproc worker (by pid).
+            let mut sent: std::collections::HashMap<u32, pacer::WorkerPace> = std::collections::HashMap::new();
             loop {
                 tick.tick().await;
                 let children: Vec<pacer::Child> =
                     pool.models.iter().filter(|m| m.phase() == Phase::Loaded).filter_map(|m| m.child()).collect();
                 pool.pacer.tick(&children);
+                sent.retain(|pid, _| children.iter().any(|c| c.pid == *pid));
+                if !pool.pacer.pause_lever() {
+                    continue;
+                }
+                for c in children.iter().filter(|c| c.pace_port.is_some()) {
+                    let want = pool.pacer.worker_pace(c.threads);
+                    if sent.get(&c.pid) == Some(&want) {
+                        continue;
+                    }
+                    let body = serde_json::json!({ "duty_pct": want.duty_pct, "threads": want.threads });
+                    let port = c.pace_port.unwrap_or(0);
+                    let ok = tokio::time::timeout(Duration::from_secs(2), llama::post_json(&pool.http, port, "/pace", &body))
+                        .await
+                        .is_ok_and(|r| r.is_ok_and(|resp| resp.status().is_success()));
+                    if ok {
+                        sent.insert(c.pid, want);
+                    }
+                }
             }
         });
     }

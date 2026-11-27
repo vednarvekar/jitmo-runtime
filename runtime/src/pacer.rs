@@ -238,6 +238,15 @@ pub struct Child {
     pub pid: u32,
     pub job: Arc<Job>,
     pub threads: u32,
+    /// An inproc engine worker's port: it is paced by `POST /pace` instead of a CPU cap.
+    pub pace_port: Option<u16>,
+}
+
+/// What an inproc worker is told at a level: compute share (%) and threads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerPace {
+    pub duty_pct: u32,
+    pub threads: u32,
 }
 
 struct Sample {
@@ -356,6 +365,18 @@ impl Pacer {
         (pct < 100).then(|| cpu_rate(pct, threads, self.logical))
     }
 
+    pub fn pause_lever(&self) -> bool {
+        self.cfg.inproc_lever != "cap"
+    }
+
+    /// The pace for an inproc worker with `threads` threads at the current level.
+    pub fn worker_pace(&self, threads: u32) -> WorkerPace {
+        let level = self.lock().level;
+        let duty_pct = self.cap_pct(level);
+        let threads = if level == Level::Heavy { threads.saturating_sub(1).max(1) } else { threads };
+        WorkerPace { duty_pct, threads }
+    }
+
     pub fn after_generation(&self, t: &RequestTiming) {
         let mut i = self.lock();
         if i.level != Level::None {
@@ -436,7 +457,7 @@ impl Pacer {
         let mut err = None;
         for c in children {
             let applied = i.applied.get(&c.pid).copied().flatten();
-            let rate = self.rate_for(want, c.threads);
+            let rate = if c.pace_port.is_some() && self.pause_lever() { None } else { self.rate_for(want, c.threads) };
             if applied != rate {
                 // Removing a cap that was never set fails, so only remove one that is set.
                 match c.job.set_cpu_rate(rate) {
@@ -742,8 +763,8 @@ mod tests {
 
     #[test]
     fn tick_caps_real_jobs_by_mode() {
-        let a = Child { pid: 1, job: Arc::new(Job::new(None).unwrap()), threads: 3 };
-        let b = Child { pid: 2, job: Arc::new(Job::new(None).unwrap()), threads: 1 };
+        let a = Child { pid: 1, job: Arc::new(Job::new(None).unwrap()), threads: 3, pace_port: None };
+        let b = Child { pid: 2, job: Arc::new(Job::new(None).unwrap()), threads: 1, pace_port: None };
         let always = Pacer::new(PacerConfig { mode: "always".into(), ..Default::default() }, 8, true, 1024);
         assert_eq!((always.rate_for(Level::Heavy, 3), always.rate_for(Level::Light, 3), always.rate_for(Level::None, 3)), (Some(1875), Some(2813), None));
         always.tick(&[a.clone()]);
@@ -763,5 +784,11 @@ mod tests {
         let auto = Pacer::new(PacerConfig::default(), 8, true, 1024);
         auto.tick(&[a, b]);
         assert!(auto.snapshot(true, 3).last_error.is_none());
+        // An inproc worker under the pause lever gets no job cap; it is told a pace instead.
+        let w = Child { pid: 3, job: Arc::new(Job::new(None).unwrap()), threads: 3, pace_port: Some(1) };
+        always.tick(&[w]);
+        assert_eq!(always.level(), Level::Heavy);
+        assert_eq!(always.worker_pace(3), WorkerPace { duty_pct: 50, threads: 2 });
+        assert_eq!(off.worker_pace(3), WorkerPace { duty_pct: 100, threads: 3 });
     }
 }

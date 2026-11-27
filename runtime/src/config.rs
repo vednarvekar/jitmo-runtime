@@ -304,6 +304,10 @@ pub struct PacerConfig {
     pub busy_priority: String,
     /// Leave the `--parent-pid` process and its other descendants out of "other programs' CPU".
     pub exclude_client_cpu: bool,
+    /// How `engine = "inproc"` models are slowed: `pause` (default: the worker pauses between
+    /// tokens so it computes the level's cap share of the time, and uses one thread less at
+    /// heavy) or `cap` (the Job Object CPU cap, like llama-server children).
+    pub inproc_lever: String,
     /// Pacer v1 keys, accepted and ignored (a warning is logged).
     pub input_active_ms: Option<u64>,
     pub others_cpu_busy_pct: Option<f64>,
@@ -327,6 +331,7 @@ impl Default for PacerConfig {
             heavy_release_after_ms: 10_000,
             busy_priority: "unchanged".into(),
             exclude_client_cpu: true,
+            inproc_lever: "pause".into(),
             input_active_ms: None,
             others_cpu_busy_pct: None,
             busy_cpu_pct: None,
