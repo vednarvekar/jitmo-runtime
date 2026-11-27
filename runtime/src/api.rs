@@ -338,21 +338,36 @@ async fn chat_inner(app: &Arc<App>, mut req: Value, model: Option<String>, guard
         }
     }
     llama::full_lora(&mut req, m.adapters.len())?;
-    let work = async {
-        let slot = app.pool.acquire(&m, &guard).await?;
-        let resp = llama::post_json(&app.pool.http, slot.port, "/v1/chat/completions", &req).await?;
-        Ok((slot, resp))
-    };
-    let (slot, resp) = match cancellable(&guard.token, &guard.id, work).await {
-        Ok(x) => x,
-        Err(e) => {
-            finish(app, &Err::<(), _>(e.clone()));
-            return Err(e);
+    // One retry if the model process dies under the request (a crash): the next acquire
+    // starts it again. A stream is retried only before any of it was sent.
+    let mut attempt = 0;
+    let (slot, resp, done) = loop {
+        let work = async {
+            let slot = app.pool.acquire(&m, &guard).await?;
+            let resp = llama::post_json(&app.pool.http, slot.port, "/v1/chat/completions", &req).await?;
+            if stream && resp.status().is_success() {
+                return Ok((slot, Some(resp), None));
+            }
+            let collected = llama::collect(resp).await?;
+            Ok((slot, None, Some(collected)))
+        };
+        match cancellable(&guard.token, &guard.id, work).await {
+            Ok(x) => break x,
+            Err(e) if e.code == "engine_error" && attempt == 0 && !guard.token.is_cancelled() => {
+                attempt += 1;
+                tracing::warn!("model '{}': {} -- retrying once after a restart", m.name(), e.message);
+                app.pool.stats.retried_after_crash();
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+            Err(e) => {
+                finish(app, &Err::<(), _>(e.clone()));
+                return Err(e);
+            }
         }
     };
-    let status = resp.status();
 
-    if stream && status.is_success() {
+    if let Some(resp) = resp {
+        let status = resp.status();
         let content_type = resp
             .headers()
             .get(header::CONTENT_TYPE)
@@ -373,14 +388,7 @@ async fn chat_inner(app: &Arc<App>, mut req: Value, model: Option<String>, guard
             .expect("valid response"));
     }
 
-    let r = cancellable(&guard.token, &guard.id, llama::collect(resp)).await;
-    let (status, bytes) = match r {
-        Ok(x) => x,
-        Err(e) => {
-            finish(app, &Err::<(), _>(e.clone()));
-            return Err(e);
-        }
-    };
+    let (status, bytes) = done.expect("non-stream answers are collected");
     if status.is_success() {
         let engine = serde_json::from_slice::<Value>(&bytes).ok().and_then(|v| llama::engine_timings(&v)).unwrap_or_default();
         let timing = RequestTiming::new("chat", slot.model.name().to_string(), slot.queue_ms, slot.load_ms, &engine, None, ms_since(started))

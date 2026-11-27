@@ -117,6 +117,7 @@ struct Inner {
     refused_memory: u64,
     refused_queue: u64,
     cancelled: u64,
+    retried_after_crash: u64,
     loads: u64,
     load_failures: u64,
     last_load_ms: Option<f64>,
@@ -142,6 +143,8 @@ pub struct Counters {
     pub refused_queue_full: u64,
     /// Requests ended by `DELETE /v1/requests/{id}`.
     pub cancelled: u64,
+    /// Requests sent again because their model process died under them.
+    pub retried_after_crash: u64,
     pub loads: u64,
     pub load_failures: u64,
     pub last_load_ms: Option<f64>,
@@ -181,6 +184,9 @@ impl Stats {
     pub fn cancelled(&self) {
         self.with(|i| i.cancelled += 1);
     }
+    pub fn retried_after_crash(&self) {
+        self.with(|i| i.retried_after_crash += 1);
+    }
     pub fn loaded(&self, ms: f64) {
         self.with(|i| {
             i.loads += 1;
@@ -217,6 +223,7 @@ impl Stats {
             refused_insufficient_memory: i.refused_memory,
             refused_queue_full: i.refused_queue,
             cancelled: i.cancelled,
+            retried_after_crash: i.retried_after_crash,
             loads: i.loads,
             load_failures: i.load_failures,
             last_load_ms: i.last_load_ms,

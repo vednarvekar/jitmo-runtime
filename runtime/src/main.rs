@@ -111,6 +111,50 @@ fn load_config(args: &Args) -> Result<Config> {
     Ok(cfg)
 }
 
+/// The runtime's own log file rolls over at this size (one old file kept as `<name>.1`).
+const LOG_MAX_BYTES: u64 = 20 << 20;
+
+/// A log file that never grows past `max`: at start the previous run's log moves to `<name>.1`
+/// (kept for diagnosing a crash), and a full file moves there too while running.
+struct CappedLog {
+    path: PathBuf,
+    file: std::fs::File,
+    written: u64,
+    max: u64,
+}
+
+impl CappedLog {
+    fn old(path: &std::path::Path) -> PathBuf {
+        let mut s = path.as_os_str().to_owned();
+        s.push(".1");
+        PathBuf::from(s)
+    }
+
+    fn open(path: &std::path::Path, max: u64) -> std::io::Result<CappedLog> {
+        if path.exists() {
+            let _ = std::fs::rename(path, Self::old(path));
+        }
+        Ok(CappedLog { path: path.to_path_buf(), file: std::fs::File::create(path)?, written: 0, max })
+    }
+}
+
+impl Write for CappedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.written + buf.len() as u64 > self.max {
+            let _ = self.file.flush();
+            let _ = std::fs::rename(&self.path, Self::old(&self.path));
+            self.file = std::fs::File::create(&self.path)?;
+            self.written = 0;
+        }
+        let n = self.file.write(buf)?;
+        self.written += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     // Developer test of the in-process engine (docs/08-inproc-engine.md); not a server mode.
@@ -147,7 +191,7 @@ async fn main() -> ExitCode {
     };
     let sub = tracing_subscriber::fmt().with_max_level(args.log_level).with_target(false);
     match &args.log_file {
-        Some(path) => match std::fs::File::create(path) {
+        Some(path) => match CappedLog::open(path, LOG_MAX_BYTES) {
             Ok(f) => sub.with_ansi(false).with_writer(std::sync::Mutex::new(f)).init(),
             Err(e) => {
                 eprintln!("error: cannot write log file {}: {e}", path.display());
@@ -270,4 +314,25 @@ async fn run(args: Args) -> Result<()> {
     }
     info!("stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+
+    #[test]
+    fn the_log_rolls_over_and_keeps_one_old_file() {
+        let dir = std::env::temp_dir().join(format!("jitmo-log-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("rt.log");
+        std::fs::write(&p, "previous run\n").unwrap();
+        let mut l = CappedLog::open(&p, 10).unwrap();
+        assert_eq!(std::fs::read_to_string(CappedLog::old(&p)).unwrap(), "previous run\n", "last run kept as .1");
+        l.write_all(b"12345678").unwrap();
+        l.write_all(b"abcd").unwrap(); // would pass 10 bytes: roll over first
+        l.flush().unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "abcd");
+        assert_eq!(std::fs::read_to_string(CappedLog::old(&p)).unwrap(), "12345678");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

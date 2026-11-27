@@ -110,13 +110,31 @@ pub struct ModelHandle {
     /// Cancel tokens of the requests that use the model now (by use id).
     users: Mutex<Vec<(u64, CancelToken)>>,
     counters: Mutex<ModelCounters>,
+    /// When its process crashed lately (for the crash-loop limit).
+    crashes: Mutex<std::collections::VecDeque<Instant>>,
 }
+
+/// A pinned model that crashed is started again, unless it crashed more than this many
+/// times within `CRASH_LOOP_WINDOW` (then it waits for a request).
+const CRASH_LOOP_MAX: usize = 3;
+const CRASH_LOOP_WINDOW: Duration = Duration::from_secs(300);
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 impl ModelHandle {
+    /// Record a crash; returns how many happened within `CRASH_LOOP_WINDOW`.
+    fn note_crash(&self) -> usize {
+        let mut c = lock(&self.crashes);
+        let now = Instant::now();
+        c.push_back(now);
+        while c.front().is_some_and(|t| now - *t > CRASH_LOOP_WINDOW) {
+            c.pop_front();
+        }
+        c.len()
+    }
+
     fn new(cfg: &Config, m: &ModelConfig) -> ModelHandle {
         ModelHandle {
             plan: MemPlan::new(m, &cfg.budget),
@@ -135,6 +153,7 @@ impl ModelHandle {
             pending_since: Mutex::new(None),
             users: Mutex::new(Vec::new()),
             counters: Mutex::new(ModelCounters::default()),
+            crashes: Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -624,8 +643,9 @@ impl Pool {
         });
     }
 
-    async fn watch_once(&self, low_count: &mut u32) {
+    async fn watch_once(self: &Arc<Self>, low_count: &mut u32) {
         // 1. A child died by itself (crash, or it hit the memory cap).
+        let mut crashed_pinned: Vec<Arc<ModelHandle>> = Vec::new();
         for m in &self.models {
             if let Ok(mut st) = m.state.try_lock() {
                 let exited = st.as_mut().and_then(|r| r.child.try_wait().ok().flatten());
@@ -636,13 +656,35 @@ impl Pool {
                         .cap_bytes
                         .is_some_and(|cap| run.job.peak_process_commit().is_some_and(|p| p as f64 >= cap as f64 * 0.97));
                     warn!(
-                        "llama-server of model '{}' exited by itself ({status}){}; the model is unloaded",
+                        "the process of model '{}' exited by itself ({status}){}; the model is unloaded",
                         m.name(),
                         if near_cap { ", after reaching the memory cap" } else { "" }
                     );
                     self.finish_stop(m, run, UnloadReason::Crashed).await;
+                    let recent = m.note_crash();
+                    if m.cfg.pinned {
+                        if recent <= CRASH_LOOP_MAX {
+                            info!("model '{}' is pinned: starting it again", m.name());
+                            crashed_pinned.push(m.clone());
+                        } else {
+                            warn!(
+                                "model '{}' crashed {recent} times in {} s: not restarting it until a request asks for it",
+                                m.name(),
+                                CRASH_LOOP_WINDOW.as_secs()
+                            );
+                        }
+                    }
                 }
             }
+        }
+        for m in crashed_pinned {
+            // In the background: the watchdog keeps watching memory meanwhile.
+            let pool = self.clone();
+            tokio::spawn(async move {
+                if let Err(e) = pool.use_model(&m, None).await {
+                    warn!("model '{}' could not be started again after its crash: {}", m.name(), e.message);
+                }
+            });
         }
         let loaded: Vec<&Arc<ModelHandle>> = self.models.iter().filter(|m| m.phase() == Phase::Loaded).collect();
         if loaded.is_empty() {
