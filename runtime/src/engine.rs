@@ -129,6 +129,11 @@ pub struct Lib {
     memory_clear: unsafe extern "C" fn(Ptr, bool),
     memory_seq_rm: unsafe extern "C" fn(Ptr, i32, i32, i32) -> bool,
     n_ctx: unsafe extern "C" fn(Ptr) -> u32,
+    adapter_lora_init: unsafe extern "C" fn(Ptr, *const c_char) -> Ptr,
+    set_adapters_lora: unsafe extern "C" fn(Ptr, *mut Ptr, usize, *mut f32) -> i32,
+    state_seq_get_size: unsafe extern "C" fn(Ptr, i32) -> usize,
+    state_seq_get_data: unsafe extern "C" fn(Ptr, *mut u8, usize, i32) -> usize,
+    state_seq_set_data: unsafe extern "C" fn(Ptr, *const u8, usize, i32) -> usize,
     set_n_threads: unsafe extern "C" fn(Ptr, i32, i32),
     synchronize: unsafe extern "C" fn(Ptr),
     sampler_chain_init: unsafe extern "C" fn(SamplerChainParams) -> Ptr,
@@ -194,6 +199,11 @@ impl Lib {
                 memory_clear: sym!(llama, "llama_memory_clear"),
                 memory_seq_rm: sym!(llama, "llama_memory_seq_rm"),
                 n_ctx: sym!(llama, "llama_n_ctx"),
+                adapter_lora_init: sym!(llama, "llama_adapter_lora_init"),
+                set_adapters_lora: sym!(llama, "llama_set_adapters_lora"),
+                state_seq_get_size: sym!(llama, "llama_state_seq_get_size"),
+                state_seq_get_data: sym!(llama, "llama_state_seq_get_data"),
+                state_seq_set_data: sym!(llama, "llama_state_seq_set_data"),
                 set_n_threads: sym!(llama, "llama_set_n_threads"),
                 synchronize: sym!(llama, "llama_synchronize"),
                 sampler_chain_init: sym!(llama, "llama_sampler_chain_init"),
@@ -255,6 +265,18 @@ pub struct LoadOptions {
     pub kv_type: i32,
     /// -1 auto, 0 off, 1 on.
     pub flash_attn: i32,
+    /// LoRA adapters loaded with the model; requests set their scales (default 0).
+    pub adapters: Vec<std::path::PathBuf>,
+    /// RAM for saved prompt states (the prompt cache), in bytes. 0 = keep only the live one.
+    pub cache_bytes: usize,
+}
+
+/// A saved KV state of sequence 0: the tokens it holds and the LoRA scales it was made with.
+struct Saved {
+    tokens: Vec<llama_token>,
+    lora: Vec<f32>,
+    data: Vec<u8>,
+    used: Instant,
 }
 
 /// The ggml type id of a KV cache type name (`-ctk` values of llama-server).
@@ -329,6 +351,11 @@ pub struct Model {
     cached: Vec<llama_token>,
     /// Threads set on the context now.
     threads: i32,
+    adapters: Vec<Ptr>,
+    /// LoRA scales the live KV cache was computed with (one per adapter).
+    lora: Vec<f32>,
+    saved: Vec<Saved>,
+    cache_bytes: usize,
 }
 
 /// What the pace hook asks for before the next token.
@@ -408,8 +435,115 @@ impl Model {
             let t = (lib.model_chat_template)(model, null());
             let template = (!t.is_null()).then(|| CStr::from_ptr(t).to_owned());
             let n_ctx = (lib.n_ctx)(ctx) as usize;
-            Ok(Model { lib, model, ctx, vocab, template, n_ctx, cached: Vec::new(), threads: o.threads })
+            let mut adapters = Vec::new();
+            for a in &o.adapters {
+                let p = CString::new(a.to_string_lossy().as_bytes())?;
+                let ad = (lib.adapter_lora_init)(model, p.as_ptr());
+                if ad.is_null() {
+                    (lib.free)(ctx);
+                    (lib.model_free)(model);
+                    bail!("cannot load LoRA adapter {}", a.display());
+                }
+                adapters.push(ad);
+            }
+            let lora = vec![0.0; adapters.len()];
+            let mut m = Model { lib, model, ctx, vocab, template, n_ctx, cached: Vec::new(), threads: o.threads, adapters, lora: Vec::new(), saved: Vec::new(), cache_bytes: o.cache_bytes };
+            m.apply_lora(&lora)?;
+            Ok(m)
         }
+    }
+
+    pub fn n_adapters(&self) -> usize {
+        self.adapters.len()
+    }
+
+    /// Set the adapters' scales. The live KV cache is only valid for the scales it was made
+    /// with, so a change drops it (saved states keep their own scales).
+    fn apply_lora(&mut self, scales: &[f32]) -> Result<()> {
+        if scales.len() != self.adapters.len() {
+            bail!("{} LoRA scale(s) for {} adapter(s)", scales.len(), self.adapters.len());
+        }
+        if self.lora == scales {
+            return Ok(());
+        }
+        if !self.adapters.is_empty() {
+            let mut s = scales.to_vec();
+            // SAFETY: adapters of this model, one scale each.
+            let rc = unsafe { (self.lib.set_adapters_lora)(self.ctx, self.adapters.as_mut_ptr(), self.adapters.len(), s.as_mut_ptr()) };
+            if rc != 0 {
+                bail!("cannot set the LoRA adapters ({rc})");
+            }
+        }
+        self.save_live();
+        self.trim_cache(0);
+        self.lora = scales.to_vec();
+        Ok(())
+    }
+
+    /// Keep the live KV state in the prompt cache before it is overwritten (big enough ones only).
+    fn save_live(&mut self) {
+        if self.cache_bytes == 0 || self.cached.len() < 32 {
+            return;
+        }
+        if self.saved.iter().any(|s| s.tokens == self.cached && s.lora == self.lora) {
+            return;
+        }
+        // SAFETY: valid context; the buffer has the size llama.cpp asked for.
+        let data = unsafe {
+            let n = (self.lib.state_seq_get_size)(self.ctx, 0);
+            if n == 0 || n > self.cache_bytes {
+                return;
+            }
+            let mut buf = vec![0u8; n];
+            let got = (self.lib.state_seq_get_data)(self.ctx, buf.as_mut_ptr(), n, 0);
+            if got == 0 {
+                return;
+            }
+            buf.truncate(got);
+            buf
+        };
+        self.saved.push(Saved { tokens: self.cached.clone(), lora: self.lora.clone(), data, used: Instant::now() });
+        // Least recently used first out, within the budget.
+        while self.saved.iter().map(|s| s.data.len()).sum::<usize>() > self.cache_bytes {
+            let (k, _) = self.saved.iter().enumerate().min_by_key(|(_, s)| s.used).expect("not empty");
+            self.saved.remove(k);
+        }
+    }
+
+    /// Restore the saved state that shares the longest prefix with `toks`, if it beats the
+    /// live cache. Returns the shared prefix length now in the cache.
+    fn best_prefix(&mut self, toks: &[llama_token]) -> usize {
+        let common = |a: &[llama_token]| a.iter().zip(toks).take_while(|(x, y)| x == y).count();
+        let live = common(&self.cached);
+        let best = self
+            .saved
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.lora == self.lora)
+            .map(|(k, s)| (k, common(&s.tokens)))
+            .max_by_key(|&(_, c)| c);
+        let Some((k, c)) = best else { return live };
+        if c <= live + 8 {
+            return live;
+        }
+        self.save_live();
+        // The save may have evicted entries: find the chosen one again by its tokens.
+        let want = self.saved[k.min(self.saved.len().saturating_sub(1))].tokens.clone();
+        let Some(k) = self.saved.iter().position(|s| s.tokens == want && s.lora == self.lora) else { return live };
+        // SAFETY: valid context and memory; data from llama_state_seq_get_data on this model.
+        let ok = unsafe {
+            (self.lib.memory_clear)((self.lib.get_memory)(self.ctx), true);
+            let s = &self.saved[k];
+            (self.lib.state_seq_set_data)(self.ctx, s.data.as_ptr(), s.data.len(), 0) > 0
+        };
+        if !ok {
+            self.saved.remove(k);
+            self.cached.clear();
+            return 0;
+        }
+        self.saved[k].used = Instant::now();
+        self.cached = self.saved[k].tokens.clone();
+        c
     }
 
     pub fn n_ctx(&self) -> usize {
@@ -527,6 +661,7 @@ impl Model {
         max_tokens: usize,
         grammar: Option<&str>,
         s: &SamplerOpts,
+        lora: &[f32],
         cancel: &std::sync::atomic::AtomicBool,
         mut on_text: impl FnMut(&str) -> Step,
         mut pace: impl FnMut(usize, Duration) -> Pace,
@@ -536,8 +671,13 @@ impl Model {
         if toks.len() >= self.n_ctx {
             bail!("the prompt has {} tokens; the context holds {}", toks.len(), self.n_ctx);
         }
-        // Reuse the shared prefix, but always read at least the last prompt token (for its logits).
-        let common = self.cached.iter().zip(&toks).take_while(|(a, b)| a == b).count().min(toks.len() - 1);
+        self.apply_lora(lora)?;
+        // Reuse the longest shared prefix (live cache or a saved state), but always read at
+        // least the last prompt token (for its logits).
+        let common = self.best_prefix(&toks).min(toks.len() - 1);
+        if common < self.cached.len() {
+            self.save_live();
+        }
         let keep = self.trim_cache(common);
         let chain = self.sampler(grammar, s)?;
         struct FreeOnDrop(&'static Lib, Ptr);
@@ -658,7 +798,7 @@ pub fn run_test(args: &[String]) -> Result<()> {
     let lib = load_static(Path::new(&lib_dir))?;
     let lib_ms = t.elapsed().as_secs_f64() * 1000.0;
     let t = Instant::now();
-    let o = LoadOptions { n_gpu_layers: ngl, ctx, threads, no_repack: true, kv_type: 1, flash_attn: -1 };
+    let o = LoadOptions { n_gpu_layers: ngl, ctx, threads, no_repack: true, kv_type: 1, flash_attn: -1, adapters: Vec::new(), cache_bytes: 0 };
     let mut m = Model::load(lib, Path::new(&model), &o)?;
     let load_ms = t.elapsed().as_secs_f64() * 1000.0;
     let mut msgs = Vec::new();
@@ -674,7 +814,7 @@ pub fn run_test(args: &[String]) -> Result<()> {
             m.trim_cache(0); // time the whole prompt each run
         }
         let mut text = String::new();
-        let g = m.generate(&formatted, max, grammar.as_deref(), &greedy, &never, |p| {
+        let g = m.generate(&formatted, max, grammar.as_deref(), &greedy, &[], &never, |p| {
             text.push_str(p);
             Step::Continue
         }, |_, _| Pace { pause: Duration::from_millis(pause_ms), threads: None })?;

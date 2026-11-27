@@ -499,7 +499,7 @@ impl Pool {
         let port = if m.port != 0 { m.port } else { free_port().map_err(|e| Error::load_failed(format!("no free port: {e}")))? };
         let (exe, args) = if m.inproc() {
             let me = std::env::current_exe().map_err(|e| Error::load_failed(format!("cannot find the runtime exe: {e}")))?;
-            (me, worker_args(m, port, h.threads))
+            (me, worker_args(m, port, h.threads, &h.adapters))
         } else {
             (m.llama_server.clone(), llama_args(m, port, h.threads, &h.adapters))
         };
@@ -795,7 +795,7 @@ fn article(k: ModelKind) -> &'static str {
 }
 
 /// The `--engine-worker` command line for `engine = "inproc"` (see worker.rs).
-pub fn worker_args(m: &ModelConfig, port: u16, threads: u32) -> Vec<String> {
+pub fn worker_args(m: &ModelConfig, port: u16, threads: u32, adapters: &[PathBuf]) -> Vec<String> {
     let mut a: Vec<String> = vec![
         "--engine-worker".into(),
         "--lib-dir".into(),
@@ -814,6 +814,8 @@ pub fn worker_args(m: &ModelConfig, port: u16, threads: u32) -> Vec<String> {
         m.kv_cache_type.clone(),
         "--flash-attn".into(),
         m.flash_attn.clone(),
+        "--cache-ram-mb".into(),
+        m.cache_ram_mb.to_string(),
     ];
     if m.no_repack {
         a.push("--no-repack".into());
@@ -821,6 +823,10 @@ pub fn worker_args(m: &ModelConfig, port: u16, threads: u32) -> Vec<String> {
     if let Some(n) = &m.gpu_layers {
         a.push("--ngl".into());
         a.push(n.clone());
+    }
+    for p in adapters {
+        a.push("--lora".into());
+        a.push(p.display().to_string());
     }
     a
 }
@@ -951,9 +957,9 @@ mod tests {
         assert!(s.ends_with("--cache-reuse 256"));
         assert!(!s.contains("-ngl") && !s.contains("--device"), "no GPU flags unless set");
         let w = ModelConfig { engine: "inproc".into(), gpu_layers: Some("all".into()), llama_server: r"C:\l\llama-server.exe".into(), ..Default::default() };
-        let wa = worker_args(&w, 7000, 2).join(" ");
+        let wa = worker_args(&w, 7000, 2, &[PathBuf::from("a.gguf")]).join(" ");
         assert!(wa.starts_with(r"--engine-worker --lib-dir C:\l --model "), "{wa}");
-        assert!(wa.contains("--port 7000 --ctx 4096 --threads 2 --kv-type f16 --flash-attn on --no-repack --ngl all"), "{wa}");
+        assert!(wa.contains("--port 7000 --ctx 4096 --threads 2 --kv-type f16 --flash-attn on --cache-ram-mb 256 --no-repack --ngl all --lora a.gguf"), "{wa}");
         let gpu = ModelConfig { gpu_layers: Some("all".into()), device: Some("Vulkan0".into()), ..Default::default() };
         let g = llama_args(&gpu, 9000, 3, &[]).join(" ");
         assert!(g.contains("-ngl all --device Vulkan0"));

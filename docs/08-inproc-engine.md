@@ -1,6 +1,6 @@
 # 08. Our own engine host: llama.cpp as a library
 
-Started 28 Nov 2026. Status: **P0, P1 done; P2 built (28 Nov), its UI-lag benefit not measured yet.** Today each model is a `llama-server` child; this replaces it step by step, behind a per-model switch. The HTTP API does not change.
+Started 28 Nov 2026. Status: **P0, P1, P3 done; P2 built (28 Nov), its UI-lag benefit not measured yet.** Today each model is a `llama-server` child; this replaces it step by step, behind a per-model switch. The HTTP API does not change.
 
 ## Why
 
@@ -36,6 +36,8 @@ Started 28 Nov 2026. Status: **P0, P1 done; P2 built (28 Nov), its UI-lag benefi
 - The KV cache of the prefix shared with the previous prompt is reused (`cache_n`).
 - The context reserves logits for **one** output token (`n_outputs_max = 1`). With Gemma's 262k vocabulary this cut the compute buffer from 521 MB to 21 MB; llama-server reserves outputs for a whole batch.
 - A closed connection or `DELETE /v1/requests/{id}` stops the generation between tokens.
+- **Prompt cache (P3):** before the live KV state is overwritten, it is saved (`llama_state_seq_get_data`, sequences of 32+ tokens) in an LRU store within `cache_ram_mb`. A new prompt restores the saved state with the longest shared prefix if it beats the live cache by more than 8 tokens. States are keyed by their LoRA scales too.
+- **LoRA (P3):** adapters load once with the model; each request's `lora` scales are applied with `llama_set_adapters_lora`. A scale change drops the live KV cache (it was made with other scales).
 
 ## Phases
 
@@ -44,5 +46,5 @@ Started 28 Nov 2026. Status: **P0, P1 done; P2 built (28 Nov), its UI-lag benefi
 | P0 | Proof of concept: load, tokenize, template, prefill, greedy decode, a pause hook | Same text and similar tok/s as llama-server, same model and threads |
 | P1 | `engine = "inproc"` per model; chat completions with grammar, simple JSON schema, streaming, cancel | **Done 28 Nov**: `runtime/scripts/smoke_inproc.py` 15/15 (CPU and Vulkan), old smoke test still passes |
 | P2 | Pacer v3: pause between tokens and live thread changes | **Built 28 Nov** (`pacer.inproc_lever = "pause"`; smoke: heavy level → 50% duty, 2 of 3 threads, paused 49% of the time). Still to do: UI-lag test against the CPU cap at the same model speed, on a quiet PC |
-| P3 | One base model shared by jobs, LoRA per job, prompt cache by KV state | RAM and switch-time measured |
+| P3 | One base model shared by jobs, LoRA per job, prompt cache by KV state | **Done 28 Nov**: LoRA per request (scale 0 = base output exactly; unknown id → 400); prompt cache A, B, A → 75 tokens restored. One base for many jobs = one inproc model + per-request LoRA (jitmo already uses one base). Several contexts per model: not needed yet |
 | P4 | Engine in our own worker process | A crash in the engine leaves the runtime running |

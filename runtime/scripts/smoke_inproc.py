@@ -15,6 +15,7 @@ CPU_DIR = r"V:\jitmo-sandbox\llama-b12606-bin-win-cpu-x64"
 VK_DIR = r"V:\jitmo-sandbox\downloads\vulkan-b12606\bin"
 ROUTER = r"V:\jitmo-sandbox\models\gemma-3-270m-it-router-Q4_K_M.gguf"
 GEMMA = r"V:\jitmo-sandbox\models\gemma-3-270m-it-Q4_K_M.gguf"
+ADAPTER = r"V:\jitmo-sandbox\adapters\router-synthetic-r1.gguf"
 failed = 0
 
 
@@ -58,7 +59,7 @@ path = '{ROUTER}'
 llama_server = '{CPU_DIR}\\llama-server.exe'
 ctx_size = 2048
 log_file = '{tmp}\\router.log'
-"""
+""" + (f"adapters = ['{ADAPTER}']\n" if os.path.exists(ADAPTER) else "")
     if vk:
         models += f"""
 [[models]]
@@ -118,6 +119,31 @@ critical_free_mb = 150
     check("grammar: one digit", st == 200 and d in list("0123"), repr(d))
     st, b2, _ = req(base, "POST", "/v1/chat/completions", chat("router", "remind me to stretch", sys_pick, max_tokens=1, grammar="root ::= [0-3]"))
     check("prefix reuse (same system prompt)", st == 200 and b2.get("timings", {}).get("cache_n", 0) > 0, b2.get("timings"))
+
+    # Prompt cache: alternate two tools' fill prompts; the third request restores the first's state.
+    def fill_sys(title):
+        return (f'Fill in the values for the tool "{title}" from the request. Copy the words the user said; do not invent '
+                "anything. Use an empty string for anything the user did not say.\n\nValues:\n- text: what it is about\n- when: the time")
+    tA, tB = fill_sys("Set a reminder for later today"), fill_sys("Add an event to the calendar")
+    req(base, "POST", "/v1/chat/completions", chat("router", "remind me to call mom at 6", tA, max_tokens=8))
+    req(base, "POST", "/v1/chat/completions", chat("router", "add lunch with raj on friday", tB, max_tokens=8))
+    st, b, _ = req(base, "POST", "/v1/chat/completions", chat("router", "remind me to pay rent tomorrow", tA, max_tokens=8))
+    tm = b.get("timings", {}) if st == 200 else {}
+    check("prompt cache: A, B, A -> A's prefix restored", st == 200 and tm.get("cache_n", 0) >= 40, tm)
+
+    if os.path.exists(ADAPTER):
+        q = chat("router", "Name three colors.", max_tokens=12)
+        _, base_out, _ = req(base, "POST", "/v1/chat/completions", q)
+        _, s0, _ = req(base, "POST", "/v1/chat/completions", {**q, "lora": [{"id": 0, "scale": 0.0}]})
+        _, s1, _ = req(base, "POST", "/v1/chat/completions", {**q, "lora": [{"id": 0, "scale": 1.0}]})
+        _, again, _ = req(base, "POST", "/v1/chat/completions", q)
+        t = lambda r: r["choices"][0]["message"]["content"] if isinstance(r, dict) and "choices" in r else r
+        check("LoRA: scale 0 = base, scale 1 differs, back to base after", t(s0) == t(base_out) and t(s1) != t(base_out) and t(again) == t(base_out),
+              [t(base_out)[:20], t(s1)[:20]])
+        st, b, _ = req(base, "POST", "/v1/chat/completions", {**q, "lora": [{"id": 3, "scale": 1.0}]})
+        check("LoRA: unknown id -> 400", st == 400, st)
+    else:
+        print("SKIP  LoRA (no adapter)")
 
     # Stream
     r = urllib.request.Request(base + "/v1/chat/completions", data=json.dumps(chat("router", "Count to five.", max_tokens=20, stream=True)).encode(),

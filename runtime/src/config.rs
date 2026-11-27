@@ -85,7 +85,7 @@ pub struct ModelConfig {
     pub path: PathBuf,
     pub llama_server: PathBuf,
     /// `llama-server` (default: a llama-server child) or `inproc` (our own worker process with
-    /// llama.dll inside: docs/08-inproc-engine.md). Chat models only, no LoRA yet.
+    /// llama.dll inside: docs/08-inproc-engine.md). Chat models only.
     pub engine: String,
     /// `inproc`: the llama.cpp build folder with llama.dll (llama.cpp b12606, CPU or Vulkan).
     /// Unset = the folder of `llama_server`.
@@ -509,9 +509,6 @@ impl Config {
             if m.inproc() {
                 if m.kind != ModelKind::Chat {
                     bail!("{}: engine = \"inproc\" is for chat models only (embeddings: use llama-server)", at());
-                }
-                if !m.adapters.is_empty() {
-                    bail!("{}: engine = \"inproc\" has no LoRA yet", at());
                 }
                 if m.device.is_some() {
                     bail!("{}: engine = \"inproc\" does not take `device` yet", at());

@@ -34,6 +34,8 @@ pub struct WorkerArgs {
     pub kv_type: String,
     pub flash_attn: String,
     pub no_repack: bool,
+    pub adapters: Vec<PathBuf>,
+    pub cache_ram_mb: u64,
 }
 
 /// The `--engine-worker` command line (the runtime builds it; see pool.rs).
@@ -49,6 +51,8 @@ pub fn parse(args: &[String]) -> Result<WorkerArgs> {
         kv_type: "f16".into(),
         flash_attn: "auto".into(),
         no_repack: false,
+        adapters: Vec::new(),
+        cache_ram_mb: 256,
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -70,6 +74,8 @@ pub fn parse(args: &[String]) -> Result<WorkerArgs> {
             "--kv-type" => w.kv_type = v()?,
             "--flash-attn" => w.flash_attn = v()?,
             "--no-repack" => w.no_repack = true,
+            "--lora" => w.adapters.push(v()?.into()),
+            "--cache-ram-mb" => w.cache_ram_mb = v()?.parse()?,
             other => bail!("unknown --engine-worker option {other}"),
         }
     }
@@ -92,6 +98,8 @@ struct Job {
     grammar: Option<String>,
     sampler: SamplerOpts,
     stop: Vec<String>,
+    /// Raw `lora` field: [{id, scale}]; missing adapters get scale 0.
+    lora: Value,
     cancel: Arc<AtomicBool>,
     events: tmpsc::UnboundedSender<Event>,
 }
@@ -172,6 +180,13 @@ fn engine_thread(mut model: Model, jobs: mpsc::Receiver<Job>, pace: Arc<PaceCtl>
                 continue;
             }
         };
+        let lora = match lora_scales(&job.lora, model.n_adapters()) {
+            Ok(l) => l,
+            Err(e) => {
+                let _ = job.events.send(Event::Error(400, e));
+                continue;
+            }
+        };
         let mut filter = StopFilter { stop: job.stop.clone(), full: String::new(), sent: 0 };
         let tx = job.events.clone();
         let r = model.generate(
@@ -179,6 +194,7 @@ fn engine_thread(mut model: Model, jobs: mpsc::Receiver<Job>, pace: Arc<PaceCtl>
             job.max_tokens,
             job.grammar.as_deref(),
             &job.sampler,
+            &lora,
             &job.cancel,
             |piece| {
                 let (out, hit) = filter.push(piece);
@@ -287,6 +303,26 @@ fn job_from(req: &Value, n_ctx: usize) -> Result<(Vec<(String, String)>, usize, 
     Ok((messages, max_tokens, grammar, sampler, stop))
 }
 
+/// `[{"id": 0, "scale": 0.5}]` -> one scale per loaded adapter (others 0).
+fn lora_scales(v: &Value, n: usize) -> Result<Vec<f32>, String> {
+    let mut s = vec![0.0f32; n];
+    match v {
+        Value::Null => {}
+        Value::Array(items) => {
+            for it in items {
+                let id = it["id"].as_u64().ok_or("each 'lora' entry needs a numeric 'id'")? as usize;
+                let scale = it["scale"].as_f64().ok_or("each 'lora' entry needs a numeric 'scale'")? as f32;
+                if id >= n {
+                    return Err(format!("'lora' id {id} does not exist; this model has {n} adapter(s)"));
+                }
+                s[id] = scale;
+            }
+        }
+        _ => return Err("'lora' must be a list of {\"id\", \"scale\"}".into()),
+    }
+    Ok(s)
+}
+
 fn timings(s: &GenStats) -> Value {
     json!({
         "cache_n": s.cached_tokens,
@@ -341,7 +377,7 @@ async fn chat(State(app): State<Arc<App>>, body: Bytes) -> Response {
     let cancel = Arc::new(AtomicBool::new(false));
     let guard = CancelOnDrop(cancel.clone());
     let (tx, mut rx) = tmpsc::unbounded_channel();
-    let job = Job { messages, max_tokens, grammar, sampler, stop, cancel, events: tx };
+    let job = Job { messages, max_tokens, grammar, sampler, stop, lora: req["lora"].clone(), cancel, events: tx };
     if app.jobs.lock().unwrap_or_else(|p| p.into_inner()).send(job).is_err() {
         return error(500, "the engine thread is gone");
     }
@@ -441,7 +477,16 @@ pub async fn run(args: &[String]) -> Result<()> {
     };
     let lib = engine::load_static(&w.lib_dir)?;
     eprintln!("engine-worker: {}", lib.system_info());
-    let opts = LoadOptions { n_gpu_layers: w.ngl, ctx: w.ctx, threads: w.threads, no_repack: w.no_repack, kv_type, flash_attn };
+    let opts = LoadOptions {
+        n_gpu_layers: w.ngl,
+        ctx: w.ctx,
+        threads: w.threads,
+        no_repack: w.no_repack,
+        kv_type,
+        flash_attn,
+        adapters: w.adapters.clone(),
+        cache_bytes: (w.cache_ram_mb as usize) << 20,
+    };
     let model = Model::load(lib, &w.model, &opts)?;
     let n_ctx = model.n_ctx();
     let (tx, rx) = mpsc::channel();
@@ -475,6 +520,13 @@ mod tests {
         assert_eq!(g.push("abc E"), ("abc ".into(), false));
         assert_eq!(g.push("x"), ("Ex".into(), false), "not a stop string after all");
         assert_eq!(g.rest(), "");
+    }
+
+    #[test]
+    fn lora_scales_fill_missing_with_zero() {
+        assert_eq!(lora_scales(&json!([{"id": 1, "scale": 0.5}]), 2).unwrap(), vec![0.0, 0.5]);
+        assert_eq!(lora_scales(&Value::Null, 1).unwrap(), vec![0.0]);
+        assert!(lora_scales(&json!([{"id": 2, "scale": 1}]), 2).is_err());
     }
 
     #[test]
