@@ -1,6 +1,6 @@
 # 08. Our own engine host: llama.cpp as a library
 
-Started 28 Nov 2026. Status: **design + proof of concept.** Today each model is a `llama-server` child; this replaces it step by step, behind a per-model switch. The HTTP API does not change.
+Started 28 Nov 2026. Status: **P0 and P1 done (28 Nov).** Today each model is a `llama-server` child; this replaces it step by step, behind a per-model switch. The HTTP API does not change.
 
 ## Why
 
@@ -29,12 +29,20 @@ Started 28 Nov 2026. Status: **design + proof of concept.** Today each model is 
 - **ABI drift.** A different llama.cpp build can change struct layouts. Pin the tag and check it at load.
 - **Feature gap with llama-server** (templates, grammar, multimodal). Keep `llama-server` as the default until the new engine passes the same tests and jitmo's sets.
 
+## How P1 works
+
+- The runtime starts `jitmo-runtime.exe --engine-worker ...` instead of `llama-server` for a model with `engine = "inproc"`. That is already P4's isolation: the worker is its own process, in the model's Job Object.
+- The worker serves `GET /health` and `POST /v1/chat/completions` (plain, stream, `grammar`, `response_format`, `stop`, sampling settings) with llama-server-style `timings` (`prompt_n`, `cache_n`, ...).
+- The KV cache of the prefix shared with the previous prompt is reused (`cache_n`).
+- The context reserves logits for **one** output token (`n_outputs_max = 1`). With Gemma's 262k vocabulary this cut the compute buffer from 521 MB to 21 MB; llama-server reserves outputs for a whole batch.
+- A closed connection or `DELETE /v1/requests/{id}` stops the generation between tokens.
+
 ## Phases
 
 | Phase | What | Done when |
 |---|---|---|
 | P0 | Proof of concept: load, tokenize, template, prefill, greedy decode, a pause hook | Same text and similar tok/s as llama-server, same model and threads |
-| P1 | `engine = "inproc"` per model; chat completions with grammar, simple JSON schema, streaming, cancel | Smoke test passes on the new engine |
+| P1 | `engine = "inproc"` per model; chat completions with grammar, simple JSON schema, streaming, cancel | **Done 28 Nov**: `runtime/scripts/smoke_inproc.py` 15/15 (CPU and Vulkan), old smoke test still passes |
 | P2 | Pacer v3: pause between tokens and live thread changes | UI-lag test better than the CPU cap at the same model speed |
 | P3 | One base model shared by jobs, LoRA per job, prompt cache by KV state | RAM and switch-time measured |
 | P4 | Engine in our own worker process | A crash in the engine leaves the runtime running |

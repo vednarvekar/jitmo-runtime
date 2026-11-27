@@ -84,6 +84,12 @@ pub struct ModelConfig {
     pub kind: ModelKind,
     pub path: PathBuf,
     pub llama_server: PathBuf,
+    /// `llama-server` (default: a llama-server child) or `inproc` (our own worker process with
+    /// llama.dll inside: docs/08-inproc-engine.md). Chat models only, no LoRA yet.
+    pub engine: String,
+    /// `inproc`: the llama.cpp build folder with llama.dll (llama.cpp b12606, CPU or Vulkan).
+    /// Unset = the folder of `llama_server`.
+    pub llama_dir: Option<PathBuf>,
     /// Never evicted to make room for another model, and never unloaded for idleness.
     /// Memory pressure still unloads it.
     pub pinned: bool,
@@ -144,6 +150,8 @@ impl Default for ModelConfig {
             kind: ModelKind::Chat,
             path: r"V:\jitmo-sandbox\models\Qwen3-4B-Instruct-2507-Q4_K_M.gguf".into(),
             llama_server: r"V:\jitmo-sandbox\llama\llama-server.exe".into(),
+            engine: "llama-server".into(),
+            llama_dir: None,
             pinned: false,
             port: 0,
             ctx_size: 4096,
@@ -177,6 +185,15 @@ impl ModelConfig {
             ModelKind::Embedding => self.ctx_size,
             ModelKind::Chat => 512,
         }
+    }
+
+    pub fn inproc(&self) -> bool {
+        self.engine == "inproc"
+    }
+
+    /// The llama.cpp build folder for `engine = "inproc"`.
+    pub fn lib_dir(&self) -> PathBuf {
+        self.llama_dir.clone().unwrap_or_else(|| self.llama_server.parent().map(PathBuf::from).unwrap_or_default())
     }
 
     pub fn log_path(&self) -> PathBuf {
@@ -479,6 +496,23 @@ impl Config {
                 }
                 if !POOLING.contains(&p.as_str()) {
                     bail!("{}: pooling must be one of {:?}", at(), POOLING);
+                }
+            }
+            if !["llama-server", "inproc"].contains(&m.engine.as_str()) {
+                bail!("{}: engine must be \"llama-server\" or \"inproc\"", at());
+            }
+            if m.inproc() {
+                if m.kind != ModelKind::Chat {
+                    bail!("{}: engine = \"inproc\" is for chat models only (embeddings: use llama-server)", at());
+                }
+                if !m.adapters.is_empty() {
+                    bail!("{}: engine = \"inproc\" has no LoRA yet", at());
+                }
+                if m.device.is_some() {
+                    bail!("{}: engine = \"inproc\" does not take `device` yet", at());
+                }
+                if crate::engine::kv_type_id(&m.kv_cache_type).is_none() {
+                    bail!("{}: kv_cache_type '{}' is not known to the inproc engine", at(), m.kv_cache_type);
                 }
             }
             if m.kind == ModelKind::Embedding && !m.adapters.is_empty() {

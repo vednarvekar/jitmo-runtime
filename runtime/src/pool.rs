@@ -492,14 +492,19 @@ impl Pool {
     async fn start_child(&self, h: &ModelHandle) -> Result<Running, Error> {
         let m = &h.cfg;
         let port = if m.port != 0 { m.port } else { free_port().map_err(|e| Error::load_failed(format!("no free port: {e}")))? };
-        let args = llama_args(m, port, h.threads, &h.adapters);
+        let (exe, args) = if m.inproc() {
+            let me = std::env::current_exe().map_err(|e| Error::load_failed(format!("cannot find the runtime exe: {e}")))?;
+            (me, worker_args(m, port, h.threads))
+        } else {
+            (m.llama_server.clone(), llama_args(m, port, h.threads, &h.adapters))
+        };
         if let Some(c) = h.plan.cap_bytes {
             info!("model '{}': memory cap {} MB ({})", m.name, c / MB, h.plan.source);
         }
-        info!("starting llama-server: {} {}", m.llama_server.display(), args.join(" "));
+        info!("starting {}: {} {}", if m.inproc() { "engine worker" } else { "llama-server" }, exe.display(), args.join(" "));
         let log_file = m.log_path();
 
-        let mut cmd = tokio::process::Command::new(&m.llama_server);
+        let mut cmd = tokio::process::Command::new(&exe);
         cmd.args(&args).stdin(Stdio::null()).kill_on_drop(true);
         let (out, err) = log_stdio(&log_file);
         cmd.stdout(out).stderr(err);
@@ -510,7 +515,7 @@ impl Pool {
         cmd.creation_flags(flags);
         let mut child = cmd
             .spawn()
-            .map_err(|e| Error::load_failed(format!("cannot start {}: {e}", m.llama_server.display())))?;
+            .map_err(|e| Error::load_failed(format!("cannot start {}: {e}", exe.display())))?;
         let pid = child.id().unwrap_or(0);
         let cap = h.plan.cap_bytes;
         let job = match contain(&child, cap) {
@@ -764,6 +769,37 @@ fn article(k: ModelKind) -> &'static str {
     }
 }
 
+/// The `--engine-worker` command line for `engine = "inproc"` (see worker.rs).
+pub fn worker_args(m: &ModelConfig, port: u16, threads: u32) -> Vec<String> {
+    let mut a: Vec<String> = vec![
+        "--engine-worker".into(),
+        "--lib-dir".into(),
+        m.lib_dir().display().to_string(),
+        "--model".into(),
+        m.path.display().to_string(),
+        "--name".into(),
+        m.name.clone(),
+        "--port".into(),
+        port.to_string(),
+        "--ctx".into(),
+        m.ctx_size.to_string(),
+        "--threads".into(),
+        threads.to_string(),
+        "--kv-type".into(),
+        m.kv_cache_type.clone(),
+        "--flash-attn".into(),
+        m.flash_attn.clone(),
+    ];
+    if m.no_repack {
+        a.push("--no-repack".into());
+    }
+    if let Some(n) = &m.gpu_layers {
+        a.push("--ngl".into());
+        a.push(n.clone());
+    }
+    a
+}
+
 /// The llama-server command line.
 pub fn llama_args(m: &ModelConfig, port: u16, threads: u32, adapters: &[PathBuf]) -> Vec<String> {
     let mut a: Vec<String> = vec![
@@ -889,6 +925,10 @@ mod tests {
         assert!(s.contains("--lora a.gguf --lora b.gguf --lora-init-without-apply"));
         assert!(s.ends_with("--cache-reuse 256"));
         assert!(!s.contains("-ngl") && !s.contains("--device"), "no GPU flags unless set");
+        let w = ModelConfig { engine: "inproc".into(), gpu_layers: Some("all".into()), llama_server: r"C:\l\llama-server.exe".into(), ..Default::default() };
+        let wa = worker_args(&w, 7000, 2).join(" ");
+        assert!(wa.starts_with(r"--engine-worker --lib-dir C:\l --model "), "{wa}");
+        assert!(wa.contains("--port 7000 --ctx 4096 --threads 2 --kv-type f16 --flash-attn on --no-repack --ngl all"), "{wa}");
         let gpu = ModelConfig { gpu_layers: Some("all".into()), device: Some("Vulkan0".into()), ..Default::default() };
         let g = llama_args(&gpu, 9000, 3, &[]).join(" ");
         assert!(g.contains("-ngl all --device Vulkan0"));

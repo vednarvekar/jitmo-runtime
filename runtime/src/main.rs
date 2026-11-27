@@ -5,6 +5,8 @@ mod budget;
 mod chain;
 mod config;
 mod engine;
+mod json_grammar;
+mod worker;
 mod error;
 mod gguf;
 mod llama;
@@ -118,6 +120,16 @@ async fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("error: {e:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    // One model served in-process; started by the runtime for `engine = "inproc"` (worker.rs).
+    if raw.first().map(String::as_str) == Some("--engine-worker") {
+        return match worker::run(&raw[1..]).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("engine-worker error: {e:#}");
                 ExitCode::FAILURE
             }
         };

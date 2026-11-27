@@ -9,7 +9,7 @@ use anyhow::{anyhow, bail, Context as _, Result};
 use libloading::os::windows::{Library, LOAD_WITH_ALTERED_SEARCH_PATH};
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::Path;
-use std::ptr::{null, null_mut};
+use std::ptr::null;
 use std::time::{Duration, Instant};
 
 pub const PINNED_BUILD: &str = "b12606";
@@ -127,12 +127,19 @@ pub struct Lib {
     decode: unsafe extern "C" fn(Ptr, Batch) -> i32,
     get_memory: unsafe extern "C" fn(Ptr) -> Ptr,
     memory_clear: unsafe extern "C" fn(Ptr, bool),
+    memory_seq_rm: unsafe extern "C" fn(Ptr, i32, i32, i32) -> bool,
+    n_ctx: unsafe extern "C" fn(Ptr) -> u32,
     set_n_threads: unsafe extern "C" fn(Ptr, i32, i32),
     synchronize: unsafe extern "C" fn(Ptr),
     sampler_chain_init: unsafe extern "C" fn(SamplerChainParams) -> Ptr,
     sampler_chain_add: unsafe extern "C" fn(Ptr, Ptr),
     sampler_init_greedy: unsafe extern "C" fn() -> Ptr,
     sampler_init_grammar: unsafe extern "C" fn(Ptr, *const c_char, *const c_char) -> Ptr,
+    sampler_init_top_k: unsafe extern "C" fn(i32) -> Ptr,
+    sampler_init_top_p: unsafe extern "C" fn(f32, usize) -> Ptr,
+    sampler_init_min_p: unsafe extern "C" fn(f32, usize) -> Ptr,
+    sampler_init_temp: unsafe extern "C" fn(f32) -> Ptr,
+    sampler_init_dist: unsafe extern "C" fn(u32) -> Ptr,
     sampler_sample: unsafe extern "C" fn(Ptr, Ptr, i32) -> llama_token,
     sampler_free: unsafe extern "C" fn(Ptr),
     print_system_info: unsafe extern "C" fn() -> *const c_char,
@@ -185,12 +192,19 @@ impl Lib {
                 decode: sym!(llama, "llama_decode"),
                 get_memory: sym!(llama, "llama_get_memory"),
                 memory_clear: sym!(llama, "llama_memory_clear"),
+                memory_seq_rm: sym!(llama, "llama_memory_seq_rm"),
+                n_ctx: sym!(llama, "llama_n_ctx"),
                 set_n_threads: sym!(llama, "llama_set_n_threads"),
                 synchronize: sym!(llama, "llama_synchronize"),
                 sampler_chain_init: sym!(llama, "llama_sampler_chain_init"),
                 sampler_chain_add: sym!(llama, "llama_sampler_chain_add"),
                 sampler_init_greedy: sym!(llama, "llama_sampler_init_greedy"),
                 sampler_init_grammar: sym!(llama, "llama_sampler_init_grammar"),
+                sampler_init_top_k: sym!(llama, "llama_sampler_init_top_k"),
+                sampler_init_top_p: sym!(llama, "llama_sampler_init_top_p"),
+                sampler_init_min_p: sym!(llama, "llama_sampler_init_min_p"),
+                sampler_init_temp: sym!(llama, "llama_sampler_init_temp"),
+                sampler_init_dist: sym!(llama, "llama_sampler_init_dist"),
                 sampler_sample: sym!(llama, "llama_sampler_sample"),
                 sampler_free: sym!(llama, "llama_sampler_free"),
                 print_system_info: sym!(llama, "llama_print_system_info"),
@@ -237,18 +251,88 @@ pub struct LoadOptions {
     pub threads: i32,
     /// No repacked copy of the weights (like llama-server's `--no-repack`).
     pub no_repack: bool,
+    /// KV cache type (ggml type id): 1 = f16, 8 = q8_0, 2 = q4_0.
+    pub kv_type: i32,
+    /// -1 auto, 0 off, 1 on.
+    pub flash_attn: i32,
 }
 
-/// One model with one context (P0).
-pub struct Model<'a> {
-    lib: &'a Lib,
+/// The ggml type id of a KV cache type name (`-ctk` values of llama-server).
+pub fn kv_type_id(name: &str) -> Option<i32> {
+    Some(match name {
+        "f32" => 0,
+        "f16" => 1,
+        "q4_0" => 2,
+        "q4_1" => 3,
+        "q5_0" => 6,
+        "q5_1" => 7,
+        "q8_0" => 8,
+        "bf16" => 30,
+        _ => return None,
+    })
+}
+
+/// Sampling settings. `temperature <= 0` = greedy.
+#[derive(Debug, Clone)]
+pub struct SamplerOpts {
+    pub temperature: f32,
+    pub top_k: i32,
+    pub top_p: f32,
+    pub min_p: f32,
+    pub seed: u32,
+}
+
+impl Default for SamplerOpts {
+    fn default() -> Self {
+        // llama-server's defaults.
+        SamplerOpts { temperature: 0.8, top_k: 40, top_p: 0.95, min_p: 0.05, seed: 0xFFFF_FFFF }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Finish {
+    /// End-of-generation token, or the caller asked to stop (a stop string).
+    Stop,
+    /// `max_tokens` or the context is full.
+    Length,
+    Cancelled,
+}
+
+/// What the caller wants after a piece of text.
+pub enum Step {
+    Continue,
+    Stop,
+}
+
+#[derive(Debug, Clone)]
+pub struct GenStats {
+    pub prompt_tokens: usize,
+    /// Prompt tokens reused from the previous request (shared prefix), not read again.
+    pub cached_tokens: usize,
+    pub prompt_ms: f64,
+    pub tokens: usize,
+    pub gen_ms: f64,
+    /// Time spent in the pause hook between tokens.
+    pub paused_ms: f64,
+    pub finish: Finish,
+}
+
+/// One model with one context. Owned by one thread.
+pub struct Model {
+    lib: &'static Lib,
     model: Ptr,
     ctx: Ptr,
     vocab: Ptr,
     template: Option<CString>,
+    n_ctx: usize,
+    /// Tokens now in the KV cache (sequence 0), for prefix reuse.
+    cached: Vec<llama_token>,
 }
 
-impl Drop for Model<'_> {
+// The pointers are only used from the thread that owns the Model.
+unsafe impl Send for Model {}
+
+impl Drop for Model {
     fn drop(&mut self) {
         // SAFETY: pointers from llama.cpp, freed once.
         unsafe {
@@ -258,18 +342,30 @@ impl Drop for Model<'_> {
     }
 }
 
-pub struct Generation {
-    pub text: String,
-    pub prompt_tokens: usize,
-    pub prompt_ms: f64,
-    pub tokens: usize,
-    pub gen_ms: f64,
-    /// Time spent in the pause hook between tokens.
-    pub paused_ms: f64,
+/// Cuts a byte stream into valid UTF-8 text, keeping an incomplete character for later.
+#[derive(Default)]
+struct Utf8Buf(Vec<u8>);
+
+impl Utf8Buf {
+    fn push(&mut self, bytes: &[u8]) -> String {
+        self.0.extend_from_slice(bytes);
+        let valid = match std::str::from_utf8(&self.0) {
+            Ok(_) => self.0.len(),
+            Err(e) if e.error_len().is_none() => e.valid_up_to(), // incomplete: wait for more
+            Err(_) => self.0.len(),                              // invalid: pass it on lossily
+        };
+        let out: Vec<u8> = self.0.drain(..valid).collect();
+        String::from_utf8_lossy(&out).into_owned()
+    }
+    fn flush(&mut self) -> String {
+        let out = String::from_utf8_lossy(&self.0).into_owned();
+        self.0.clear();
+        out
+    }
 }
 
-impl<'a> Model<'a> {
-    pub fn load(lib: &'a Lib, path: &Path, o: &LoadOptions) -> Result<Model<'a>> {
+impl Model {
+    pub fn load(lib: &'static Lib, path: &Path, o: &LoadOptions) -> Result<Model> {
         // SAFETY: llama.cpp API calls with params from its own defaults.
         unsafe {
             let mut mp = (lib.model_default_params)();
@@ -283,19 +379,31 @@ impl<'a> Model<'a> {
             let mut cp = (lib.context_default_params)();
             cp.n_ctx = o.ctx;
             cp.n_batch = o.ctx.min(2048);
+            cp.n_ubatch = cp.n_batch.min(512);
+            // We only read the last token's logits. With a big vocabulary (Gemma: 262k) the default
+            // (outputs for a whole batch) makes a ~540 MB compute buffer.
+            cp.n_outputs_max = 1;
             cp.n_threads = o.threads;
             cp.n_threads_batch = o.threads;
+            cp.type_k = o.kv_type;
+            cp.type_v = o.kv_type;
+            cp.flash_attn_type = o.flash_attn;
             cp.no_perf = true;
             let ctx = (lib.init_from_model)(model, cp);
             if ctx.is_null() {
                 (lib.model_free)(model);
-                bail!("cannot create a context");
+                bail!("cannot create a context (ctx {})", o.ctx);
             }
             let vocab = (lib.model_get_vocab)(model);
             let t = (lib.model_chat_template)(model, null());
             let template = (!t.is_null()).then(|| CStr::from_ptr(t).to_owned());
-            Ok(Model { lib, model, ctx, vocab, template })
+            let n_ctx = (lib.n_ctx)(ctx) as usize;
+            Ok(Model { lib, model, ctx, vocab, template, n_ctx, cached: Vec::new() })
         }
+    }
+
+    pub fn n_ctx(&self) -> usize {
+        self.n_ctx
     }
 
     pub fn set_threads(&self, n: i32) {
@@ -304,10 +412,10 @@ impl<'a> Model<'a> {
     }
 
     /// Format (role, content) messages with the model's built-in chat template.
-    pub fn apply_template(&self, msgs: &[(&str, &str)]) -> Result<String> {
+    pub fn apply_template(&self, msgs: &[(String, String)]) -> Result<String> {
         let tmpl = self.template.as_ref().ok_or_else(|| anyhow!("the model has no chat template"))?;
         let owned: Vec<(CString, CString)> =
-            msgs.iter().map(|(r, c)| Ok((CString::new(*r)?, CString::new(*c)?))).collect::<Result<_>>()?;
+            msgs.iter().map(|(r, c)| Ok((CString::new(r.as_str())?, CString::new(c.as_str())?))).collect::<Result<_>>()?;
         let chat: Vec<ChatMessage> = owned.iter().map(|(r, c)| ChatMessage { role: r.as_ptr(), content: c.as_ptr() }).collect();
         let mut buf = vec![0u8; 2 * msgs.iter().map(|m| m.1.len() + m.0.len()).sum::<usize>() + 512];
         for _ in 0..2 {
@@ -325,7 +433,7 @@ impl<'a> Model<'a> {
         bail!("chat template output kept growing")
     }
 
-    fn tokenize(&self, text: &str) -> Result<Vec<llama_token>> {
+    pub fn tokenize(&self, text: &str) -> Result<Vec<llama_token>> {
         let mut toks = vec![0; text.len() + 16];
         // SAFETY: buffers valid for the call.
         let n = unsafe { (self.lib.tokenize)(self.vocab, text.as_ptr() as *const c_char, text.len() as i32, toks.as_mut_ptr(), toks.len() as i32, true, true) };
@@ -343,70 +451,157 @@ impl<'a> Model<'a> {
         buf[..n.max(0) as usize].to_vec()
     }
 
-    /// Greedy generation from a formatted prompt. `grammar` = GBNF (root rule `root`).
-    /// `pace` runs between tokens and may sleep: the pause point a server can't give us.
-    pub fn generate(&self, prompt: &str, max_tokens: usize, grammar: Option<&str>, mut pace: impl FnMut(usize) -> Duration) -> Result<Generation> {
-        let mut toks = self.tokenize(prompt)?;
-        // SAFETY: llama.cpp calls on our own context, sampler and token buffers.
+    /// Drop the KV cache after `keep` tokens. False if the model can't cut its cache there
+    /// (some SWA or recurrent models); then the whole cache is cleared.
+    fn trim_cache(&mut self, keep: usize) -> usize {
+        // SAFETY: valid context and its memory.
         unsafe {
-            (self.lib.memory_clear)((self.lib.get_memory)(self.ctx), true);
+            let mem = (self.lib.get_memory)(self.ctx);
+            if keep > 0 && (self.lib.memory_seq_rm)(mem, 0, keep as i32, -1) {
+                self.cached.truncate(keep);
+                return keep;
+            }
+            (self.lib.memory_clear)(mem, true);
+        }
+        self.cached.clear();
+        0
+    }
+
+    fn sampler(&self, grammar: Option<&str>, s: &SamplerOpts) -> Result<Ptr> {
+        // SAFETY: llama.cpp sampler API; the chain owns the samplers added to it.
+        unsafe {
             let chain = (self.lib.sampler_chain_init)((self.lib.sampler_chain_default_params)());
             if let Some(g) = grammar {
                 let gs = CString::new(g)?;
-                let s = (self.lib.sampler_init_grammar)(self.vocab, gs.as_ptr(), c"root".as_ptr());
-                if s.is_null() {
+                let gr = (self.lib.sampler_init_grammar)(self.vocab, gs.as_ptr(), c"root".as_ptr());
+                if gr.is_null() {
                     (self.lib.sampler_free)(chain);
-                    bail!("grammar does not parse");
+                    bail!("the grammar does not parse");
                 }
-                (self.lib.sampler_chain_add)(chain, s);
+                (self.lib.sampler_chain_add)(chain, gr);
             }
-            (self.lib.sampler_chain_add)(chain, (self.lib.sampler_init_greedy)());
-
-            let t0 = Instant::now();
-            let n_prompt = toks.len();
-            for chunk in toks.chunks_mut(2048) {
-                let rc = (self.lib.decode)(self.ctx, (self.lib.batch_get_one)(chunk.as_mut_ptr(), chunk.len() as i32));
-                if rc != 0 {
-                    (self.lib.sampler_free)(chain);
-                    bail!("decode of the prompt failed ({rc})");
+            if s.temperature <= 0.0 {
+                (self.lib.sampler_chain_add)(chain, (self.lib.sampler_init_greedy)());
+            } else {
+                if s.top_k > 0 {
+                    (self.lib.sampler_chain_add)(chain, (self.lib.sampler_init_top_k)(s.top_k));
                 }
+                if s.top_p < 1.0 {
+                    (self.lib.sampler_chain_add)(chain, (self.lib.sampler_init_top_p)(s.top_p, 1));
+                }
+                if s.min_p > 0.0 {
+                    (self.lib.sampler_chain_add)(chain, (self.lib.sampler_init_min_p)(s.min_p, 1));
+                }
+                (self.lib.sampler_chain_add)(chain, (self.lib.sampler_init_temp)(s.temperature));
+                (self.lib.sampler_chain_add)(chain, (self.lib.sampler_init_dist)(s.seed));
             }
-            (self.lib.synchronize)(self.ctx); // a GPU decode returns before it is done
-            let prompt_ms = t0.elapsed().as_secs_f64() * 1000.0;
-
-            let t1 = Instant::now();
-            let mut out = Vec::new();
-            let mut paused = Duration::ZERO;
-            let mut n = 0;
-            while n < max_tokens {
-                let mut t = (self.lib.sampler_sample)(chain, self.ctx, -1);
-                if (self.lib.vocab_is_eog)(self.vocab, t) {
-                    break;
-                }
-                out.extend(self.piece(t));
-                n += 1;
-                let wait = pace(n);
-                if !wait.is_zero() {
-                    std::thread::sleep(wait);
-                    paused += wait;
-                }
-                let rc = (self.lib.decode)(self.ctx, (self.lib.batch_get_one)(&mut t, 1));
-                if rc != 0 {
-                    (self.lib.sampler_free)(chain);
-                    bail!("decode failed ({rc})");
-                }
-            }
-            (self.lib.sampler_free)(chain);
-            Ok(Generation {
-                text: String::from_utf8_lossy(&out).into_owned(),
-                prompt_tokens: n_prompt,
-                prompt_ms,
-                tokens: n,
-                gen_ms: t1.elapsed().as_secs_f64() * 1000.0,
-                paused_ms: paused.as_secs_f64() * 1000.0,
-            })
+            Ok(chain)
         }
     }
+
+    /// Generate from a formatted prompt. The KV cache of the shared prefix with the previous
+    /// prompt is reused. `on_text` gets valid UTF-8 pieces and may stop the generation; `pace`
+    /// runs between tokens and returns how long to pause (the pause point a server can't give
+    /// us). `cancel` is checked between tokens.
+    pub fn generate(
+        &mut self,
+        prompt: &str,
+        max_tokens: usize,
+        grammar: Option<&str>,
+        s: &SamplerOpts,
+        cancel: &std::sync::atomic::AtomicBool,
+        mut on_text: impl FnMut(&str) -> Step,
+        mut pace: impl FnMut(usize) -> Duration,
+    ) -> Result<GenStats> {
+        use std::sync::atomic::Ordering;
+        let toks = self.tokenize(prompt)?;
+        if toks.len() >= self.n_ctx {
+            bail!("the prompt has {} tokens; the context holds {}", toks.len(), self.n_ctx);
+        }
+        // Reuse the shared prefix, but always read at least the last prompt token (for its logits).
+        let common = self.cached.iter().zip(&toks).take_while(|(a, b)| a == b).count().min(toks.len() - 1);
+        let keep = self.trim_cache(common);
+        let chain = self.sampler(grammar, s)?;
+        struct FreeOnDrop(&'static Lib, Ptr);
+        impl Drop for FreeOnDrop {
+            fn drop(&mut self) {
+                // SAFETY: the chain is freed once.
+                unsafe { (self.0.sampler_free)(self.1) }
+            }
+        }
+        let _free = FreeOnDrop(self.lib, chain);
+
+        let t0 = Instant::now();
+        let mut rest = toks[keep..].to_vec();
+        for chunk in rest.chunks_mut(2048) {
+            // SAFETY: our own context and token buffer.
+            let rc = unsafe { (self.lib.decode)(self.ctx, (self.lib.batch_get_one)(chunk.as_mut_ptr(), chunk.len() as i32)) };
+            if rc != 0 {
+                self.trim_cache(0);
+                bail!("reading the prompt failed ({rc})");
+            }
+            self.cached.extend_from_slice(chunk);
+        }
+        // SAFETY: valid context. A GPU decode returns before it is done.
+        unsafe { (self.lib.synchronize)(self.ctx) };
+        let prompt_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        let t1 = Instant::now();
+        let mut utf8 = Utf8Buf::default();
+        let mut paused = Duration::ZERO;
+        let mut n = 0;
+        let finish = loop {
+            if cancel.load(Ordering::SeqCst) {
+                break Finish::Cancelled;
+            }
+            if n >= max_tokens || self.cached.len() >= self.n_ctx {
+                break Finish::Length;
+            }
+            // SAFETY: valid sampler chain and context.
+            let mut t = unsafe { (self.lib.sampler_sample)(chain, self.ctx, -1) };
+            // SAFETY: valid vocab.
+            if unsafe { (self.lib.vocab_is_eog)(self.vocab, t) } {
+                break Finish::Stop;
+            }
+            n += 1;
+            let text = utf8.push(&self.piece(t));
+            if !text.is_empty() {
+                if let Step::Stop = on_text(&text) {
+                    break Finish::Stop;
+                }
+            }
+            let wait = pace(n);
+            if !wait.is_zero() {
+                std::thread::sleep(wait);
+                paused += wait;
+            }
+            // SAFETY: our own context; one token.
+            let rc = unsafe { (self.lib.decode)(self.ctx, (self.lib.batch_get_one)(&mut t, 1)) };
+            if rc != 0 {
+                self.trim_cache(0);
+                bail!("decode failed ({rc})");
+            }
+            self.cached.push(t);
+        };
+        let tail = utf8.flush();
+        if !tail.is_empty() && finish != Finish::Cancelled {
+            on_text(&tail);
+        }
+        Ok(GenStats {
+            prompt_tokens: toks.len(),
+            cached_tokens: keep,
+            prompt_ms,
+            tokens: n,
+            gen_ms: t1.elapsed().as_secs_f64() * 1000.0,
+            paused_ms: paused.as_secs_f64() * 1000.0,
+            finish,
+        })
+    }
+}
+
+/// Load a llama.cpp build folder once for the whole process.
+pub fn load_static(dir: &Path) -> Result<&'static Lib> {
+    Ok(Box::leak(Box::new(Lib::load(dir)?)))
 }
 
 /// `jitmo-runtime --engine-test`: load a model in-process, generate, print timings as JSON.
@@ -437,19 +632,29 @@ pub fn run_test(args: &[String]) -> Result<()> {
         bail!("--engine-test needs --model <file.gguf>");
     }
     let t = Instant::now();
-    let lib = Lib::load(Path::new(&lib_dir))?;
+    let lib = load_static(Path::new(&lib_dir))?;
     let lib_ms = t.elapsed().as_secs_f64() * 1000.0;
     let t = Instant::now();
-    let m = Model::load(&lib, Path::new(&model), &LoadOptions { n_gpu_layers: ngl, ctx, threads, no_repack: true })?;
+    let o = LoadOptions { n_gpu_layers: ngl, ctx, threads, no_repack: true, kv_type: 1, flash_attn: -1 };
+    let mut m = Model::load(lib, Path::new(&model), &o)?;
     let load_ms = t.elapsed().as_secs_f64() * 1000.0;
     let mut msgs = Vec::new();
     if !system.is_empty() {
-        msgs.push(("system", system.as_str()));
+        msgs.push(("system".to_string(), system.clone()));
     }
-    msgs.push(("user", prompt.as_str()));
+    msgs.push(("user".to_string(), prompt.clone()));
     let formatted = m.apply_template(&msgs)?;
+    let greedy = SamplerOpts { temperature: 0.0, ..Default::default() };
+    let never = std::sync::atomic::AtomicBool::new(false);
     for run in 1..=runs {
-        let g = m.generate(&formatted, max, grammar.as_deref(), |_| Duration::from_millis(pause_ms))?;
+        if run > 1 {
+            m.trim_cache(0); // time the whole prompt each run
+        }
+        let mut text = String::new();
+        let g = m.generate(&formatted, max, grammar.as_deref(), &greedy, &never, |p| {
+            text.push_str(p);
+            Step::Continue
+        }, |_| Duration::from_millis(pause_ms))?;
         let tps = if g.gen_ms - g.paused_ms > 0.0 { g.tokens as f64 * 1000.0 / (g.gen_ms - g.paused_ms) } else { 0.0 };
         println!(
             "{}",
@@ -457,10 +662,29 @@ pub fn run_test(args: &[String]) -> Result<()> {
                 "run": run, "lib_ms": lib_ms.round(), "load_ms": load_ms.round(), "ngl": ngl, "threads": threads,
                 "prompt_tokens": g.prompt_tokens, "prompt_ms": (g.prompt_ms * 10.0).round() / 10.0,
                 "prompt_tps": (g.prompt_tokens as f64 * 1000.0 / g.prompt_ms).round(),
-                "tokens": g.tokens, "gen_tps": (tps * 10.0).round() / 10.0, "paused_ms": g.paused_ms.round(), "text": g.text,
+                "tokens": g.tokens, "gen_tps": (tps * 10.0).round() / 10.0, "paused_ms": g.paused_ms.round(), "text": text,
             })
         );
     }
-    let _ = null_mut::<c_void>();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utf8_pieces_wait_for_whole_characters() {
+        let mut b = Utf8Buf::default();
+        let e = "é".as_bytes(); // 2 bytes
+        assert_eq!(b.push(&[b'a', e[0]]), "a");
+        assert_eq!(b.push(&[e[1], b'b']), "éb");
+        assert_eq!(b.push(&[0xE2]), "");
+        assert_eq!(b.flush(), "\u{FFFD}");
+    }
+
+    #[test]
+    fn kv_type_names() {
+        assert_eq!((kv_type_id("f16"), kv_type_id("q8_0"), kv_type_id("x")), (Some(1), Some(8), None));
+    }
 }
