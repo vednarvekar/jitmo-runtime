@@ -118,6 +118,12 @@ pub struct ModelConfig {
     pub adapters: Vec<PathBuf>,
     /// Sent as `chat_template_kwargs` on every request that does not set its own.
     pub chat_template_kwargs: Option<Value>,
+    /// GPU offload (`-ngl`): `"0"` = CPU only, a layer count, `"auto"` or `"all"`. Needs a GPU
+    /// build of llama-server in `llama_server` (for example Vulkan for Iris Xe). Unset = the
+    /// llama-server default (a GPU build may then offload everything).
+    pub gpu_layers: Option<String>,
+    /// Device(s) for the offload (`--device`, for example `"Vulkan0"`). Unset = llama-server's choice.
+    pub device: Option<String>,
     /// Extra llama-server arguments, appended as-is.
     pub extra_args: Vec<String>,
     /// File for llama-server's own log (truncated at each start). Empty = discard.
@@ -152,6 +158,8 @@ impl Default for ModelConfig {
             pooling: None,
             adapters: Vec::new(),
             chat_template_kwargs: None,
+            gpu_layers: None,
+            device: None,
             extra_args: Vec::new(),
             log_file: None,
             load_timeout_secs: 180,
@@ -456,6 +464,11 @@ impl Config {
             }
             if !["on", "off", "auto"].contains(&m.flash_attn.as_str()) {
                 bail!("{}: flash_attn must be on, off or auto", at());
+            }
+            if let Some(n) = &m.gpu_layers {
+                if !(n == "auto" || n == "all" || (!n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))) {
+                    bail!("{}: gpu_layers must be a layer count, \"auto\" or \"all\"", at());
+                }
             }
             if m.ctx_size < 256 {
                 bail!("{}: ctx_size must be at least 256", at());

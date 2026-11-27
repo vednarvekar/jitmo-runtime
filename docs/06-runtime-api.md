@@ -112,6 +112,8 @@ ctx_size = 512
 | `pooling` | none | Embedding models only: `none`, `mean`, `cls`, `last`, `rank`. Unset = the model's own (MiniLM's GGUF says mean). |
 | `adapters` | `[]` | LoRA adapter files loaded with the model at scale 0. Requests turn them on by id (see [LoRA](#lora-adapters)). |
 | `chat_template_kwargs` | none | Added to every request that does not set its own. Use `{ enable_thinking = false }` for Qwen3 models; nothing for Gemma. |
+| `gpu_layers` | unset | 28 Nov. GPU offload (`-ngl`): `"0"` = CPU only, a layer count, `"auto"` or `"all"`. Needs a GPU build of llama-server in `llama_server` (for example Vulkan for Iris Xe). Unset = llama-server's default (a GPU build may then offload everything). Not measured yet: speed, and whether the load estimate and memory cap fit an integrated GPU (its memory is shared system RAM). |
+| `device` | unset | 28 Nov. Offload device (`--device`, for example `"Vulkan0"`). |
 | `extra_args` | `[]` | Extra llama-server arguments, passed as-is. |
 | `log_file` | see meaning | llama-server's log, rewritten at each start. Default `llama-server.log` with one model, `llama-server-<name>.log` with several. `""` = discard. |
 | `load_timeout_secs` | `180` | Give up if the model is not ready after this long. |

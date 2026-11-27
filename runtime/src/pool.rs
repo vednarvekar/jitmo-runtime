@@ -822,6 +822,14 @@ pub fn llama_args(m: &ModelConfig, port: u16, threads: u32, adapters: &[PathBuf]
         // Adapters are loaded once with scale 0; each request (or chain step) sets its own scale.
         a.push("--lora-init-without-apply".into());
     }
+    if let Some(n) = &m.gpu_layers {
+        a.push("-ngl".into());
+        a.push(n.clone());
+    }
+    if let Some(d) = &m.device {
+        a.push("--device".into());
+        a.push(d.clone());
+    }
     a.extend(m.extra_args.iter().cloned());
     a
 }
@@ -880,6 +888,10 @@ mod tests {
         assert!(s.contains("--cache-ram 256 --ctx-checkpoints 4"));
         assert!(s.contains("--lora a.gguf --lora b.gguf --lora-init-without-apply"));
         assert!(s.ends_with("--cache-reuse 256"));
+        assert!(!s.contains("-ngl") && !s.contains("--device"), "no GPU flags unless set");
+        let gpu = ModelConfig { gpu_layers: Some("all".into()), device: Some("Vulkan0".into()), ..Default::default() };
+        let g = llama_args(&gpu, 9000, 3, &[]).join(" ");
+        assert!(g.contains("-ngl all --device Vulkan0"));
         assert!(!s.contains("--embeddings"));
         let plain = llama_args(&ModelConfig { no_repack: false, ..Default::default() }, 1, 1, &[]).join(" ");
         assert!(!plain.contains("--lora") && !plain.contains("-lm none") && !plain.contains("--no-repack"));
