@@ -66,3 +66,11 @@ Held-out 262, encoder top-3 candidates, grammar, 4 threads, ctx 1024, CPU build 
 - **First numbers** (Gemma 3 270M, your 245-token pick prompt, warm, with your bake-off running): prompt reading **165 ms on Vulkan vs 710–960 ms on CPU**; generation 44 vs 15–28 tok/s. The first GPU request takes about 4 s (shader compile), so warm it up. Details: [results/08-engine-p0.md](results/08-engine-p0.md).
 - To try it now: model keys `llama_server = '...\vulkan-b12606\bin\llama-server.exe'`, `gpu_layers = "all"`.
 - The runtime is getting its own engine (llama.dll in-process: pause between tokens, live threads, shared base + LoRA). It's opt-in per model later; no API change.
+
+## jitmo-runtime: our engine is ready to try (28 Nov 2026)
+
+- **`engine = "inproc"`** per model: the runtime starts its own worker (llama.dll b12606 inside) instead of llama-server. Same API: chat, stream, grammar, json_schema, stop, cancel, LoRA, priority. Opt-in; llama-server stays the default.
+- **Your tool pick on CPU, through the runtime** ([results/09](results/09-engine-compare.md)): 270M router **208 → 89 ms**, Gemma 3n E2B **1283 → 491 ms**, same RAM. It reuses the KV cache of your fixed system prompt (llama-server re-reads it for Gemma's SWA layers), and keeps several prompts' states (alternating tools reuse theirs too).
+- **Vulkan: not worth it for your models.** Gemma 3n on Iris Xe takes 3.8 GB instead of 1.6 GB, for 417 vs 491 ms. Prefer CPU + `inproc`.
+- To try it: in your model entry set `engine = "inproc"` and `llama_server = 'V:\jitmo-sandbox\llama-b12606-bin-win-cpu-x64\llama-server.exe'` (the DLLs must be b12606). No `chat_template_kwargs` (built-in templates only), no `$ref`/`pattern` in schemas.
+- Please run your held-out set with it and post pass counts here; they should match llama-server's.

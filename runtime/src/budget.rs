@@ -229,7 +229,27 @@ impl MemPlan {
             .map(|g| ON_DISK_TENSORS.iter().map(|p| (p.to_string(), g.tensor_bytes(p))).filter(|(_, n)| *n > 0).collect())
             .unwrap_or_default();
         let override_mb = m.load_estimate_mb.unwrap_or(b.load_estimate_mb);
-        MemPlan::decide(m.memory_cap_mb.unwrap_or(b.memory_cap_mb), estimate, file_bytes, on_disk, m.no_repack, override_mb)
+        let mut plan = MemPlan::decide(m.memory_cap_mb.unwrap_or(b.memory_cap_mb), estimate, file_bytes, on_disk, m.no_repack, override_mb);
+        if m.gpu_layers.as_deref().is_some_and(|n| n != "0") {
+            plan.add_gpu_offload();
+        }
+        plan
+    }
+
+    /// GPU offload (`gpu_layers`): on an integrated GPU the device buffers are system RAM that
+    /// counts as the process's private memory (measured 28 Nov: Gemma 3 270M on Vulkan, private
+    /// 150 -> 766 MB; Gemma 3n under the plain auto cap failed to load). Count the weights once
+    /// more as private, in the auto cap and in the load estimate. Mapped pages stay counted too:
+    /// the file is still mapped while the weights are uploaded.
+    pub fn add_gpu_offload(&mut self) {
+        let w = self.load.mapped_bytes.max(self.estimate.as_ref().map_or(0, |e| e.weights_bytes));
+        if self.source == "auto" {
+            self.cap_bytes = self.cap_bytes.map(|c| c + w);
+        }
+        if self.load.source == "estimate" {
+            self.load.private_bytes += w;
+            self.load.total_bytes += w;
+        }
     }
 
     pub fn decide(
@@ -417,6 +437,10 @@ mod tests {
         assert_eq!(p.load.mapped_bytes, 1447 * MB);
         assert_eq!(p.load_bytes(), (560 + 1447) * MB, "v0.2 counted the 1216 MiB cap as private");
         assert_eq!(p.cap_mb(), 1216, "the cap itself is unchanged");
+        // GPU offload: the weights count once more, in the cap and the estimate.
+        let mut g = p.clone();
+        g.add_gpu_offload();
+        assert_eq!((g.cap_mb(), g.load_bytes()), (1216 + 1447, (560 + 2 * 1447) * MB));
         // Repacking copies the mapped weights into private memory.
         let r = MemPlan::decide(MemoryCap::Auto, Some(e.clone()), 2887 * MB, ple, false, 0);
         assert_eq!(r.load_bytes(), (560 + 2 * 1447) * MB);

@@ -209,9 +209,12 @@ fn engine_thread(mut model: Model, jobs: mpsc::Receiver<Job>, pace: Arc<PaceCtl>
             },
             |_, step| {
                 let t = pace.threads.load(Ordering::SeqCst);
+                let duty = pace.duty_pct.load(Ordering::SeqCst);
                 Pace {
-                    pause: duty_pause(step, pace.duty_pct.load(Ordering::SeqCst)),
+                    pause: duty_pause(step, duty),
                     threads: Some(if t > 0 { t } else { start_threads }),
+                    // Paced: read the prompt 64 tokens at a time so the PC gets turns in between.
+                    prompt_chunk: (duty < 100).then_some(64),
                 }
             },
         );

@@ -1,6 +1,6 @@
 # 08. Our own engine host: llama.cpp as a library
 
-Started 28 Nov 2026. Status: **P0, P1, P3 done; P2 built (28 Nov), its UI-lag benefit not measured yet.** Today each model is a `llama-server` child; this replaces it step by step, behind a per-model switch. The HTTP API does not change.
+Started 28 Nov 2026. Status: **P0–P3 done (28 Nov).** Measured: [results/09](results/09-engine-compare.md). Today each model is a `llama-server` child; this replaces it step by step, behind a per-model switch. The HTTP API does not change.
 
 ## Why
 
@@ -45,6 +45,6 @@ Started 28 Nov 2026. Status: **P0, P1, P3 done; P2 built (28 Nov), its UI-lag be
 |---|---|---|
 | P0 | Proof of concept: load, tokenize, template, prefill, greedy decode, a pause hook | Same text and similar tok/s as llama-server, same model and threads |
 | P1 | `engine = "inproc"` per model; chat completions with grammar, simple JSON schema, streaming, cancel | **Done 28 Nov**: `runtime/scripts/smoke_inproc.py` 15/15 (CPU and Vulkan), old smoke test still passes |
-| P2 | Pacer v3: pause between tokens and live thread changes | **Built 28 Nov** (`pacer.inproc_lever = "pause"`; smoke: heavy level → 50% duty, 2 of 3 threads, paused 49% of the time). Still to do: UI-lag test against the CPU cap at the same model speed, on a quiet PC |
+| P2 | Pacer v3: pause between tokens (and between 64-token prompt chunks) and live thread changes | **Built and measured 28 Nov** ([results/09](results/09-engine-compare.md)): answers faster than the CPU cap at the same throughput (4.1 vs 4.9 s), but neither lever cuts the foreground slowdown much (memory bandwidth). Next lever: pause only while the user interacts |
 | P3 | One base model shared by jobs, LoRA per job, prompt cache by KV state | **Done 28 Nov**: LoRA per request (scale 0 = base output exactly; unknown id → 400); prompt cache A, B, A → 75 tokens restored. One base for many jobs = one inproc model + per-request LoRA (jitmo already uses one base). Several contexts per model: not needed yet |
 | P4 | Engine in our own worker process | A crash in the engine leaves the runtime running |

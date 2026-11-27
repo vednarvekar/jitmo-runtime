@@ -364,6 +364,9 @@ pub struct Pace {
     pub pause: Duration,
     /// Change the thread count (takes effect from the next decode).
     pub threads: Option<i32>,
+    /// Read the prompt in chunks of this many tokens, pausing between them (asked once,
+    /// before the prompt, with token count 0). None = one big batch.
+    pub prompt_chunk: Option<usize>,
 }
 
 // The pointers are only used from the thread that owns the Model.
@@ -691,7 +694,17 @@ impl Model {
 
         let t0 = Instant::now();
         let mut rest = toks[keep..].to_vec();
-        for chunk in rest.chunks_mut(2048) {
+        // Most of a short answer's cost is reading the prompt, so the pace applies here too:
+        // small chunks with a pause after each (token count 0 = prompt).
+        let p0 = pace(0, Duration::ZERO);
+        if let Some(t) = p0.threads {
+            self.set_threads(t);
+        }
+        let chunk_len = p0.prompt_chunk.unwrap_or(2048).clamp(16, 2048);
+        let mut paused = Duration::ZERO;
+        let n_chunks = rest.len().div_ceil(chunk_len);
+        for (k, chunk) in rest.chunks_mut(chunk_len).enumerate() {
+            let step = Instant::now();
             // SAFETY: our own context and token buffer.
             let rc = unsafe { (self.lib.decode)(self.ctx, (self.lib.batch_get_one)(chunk.as_mut_ptr(), chunk.len() as i32)) };
             if rc != 0 {
@@ -699,6 +712,16 @@ impl Model {
                 bail!("reading the prompt failed ({rc})");
             }
             self.cached.extend_from_slice(chunk);
+            if k + 1 < n_chunks {
+                if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                let p = pace(0, step.elapsed());
+                if !p.pause.is_zero() {
+                    std::thread::sleep(p.pause);
+                    paused += p.pause;
+                }
+            }
         }
         // SAFETY: valid context. A GPU decode returns before it is done.
         unsafe { (self.lib.synchronize)(self.ctx) };
@@ -706,7 +729,6 @@ impl Model {
 
         let t1 = Instant::now();
         let mut utf8 = Utf8Buf::default();
-        let mut paused = Duration::ZERO;
         let mut n = 0;
         let mut work_start = Instant::now();
         let finish = loop {
@@ -817,7 +839,7 @@ pub fn run_test(args: &[String]) -> Result<()> {
         let g = m.generate(&formatted, max, grammar.as_deref(), &greedy, &[], &never, |p| {
             text.push_str(p);
             Step::Continue
-        }, |_, _| Pace { pause: Duration::from_millis(pause_ms), threads: None })?;
+        }, |_, _| Pace { pause: Duration::from_millis(pause_ms), threads: None, prompt_chunk: None })?;
         let tps = if g.gen_ms - g.paused_ms > 0.0 { g.tokens as f64 * 1000.0 / (g.gen_ms - g.paused_ms) } else { 0.0 };
         println!(
             "{}",
